@@ -10,5 +10,8 @@ repository.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
 rayo-core = { path = "../rayo-core" }
 winreg.workspace = true

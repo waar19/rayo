@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,6 +6,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
+use grep_regex::RegexMatcherBuilder;
+use grep_searcher::SearcherBuilder;
+use grep_searcher::sinks::UTF8;
+use ignore::WalkBuilder;
 use rayo_core::{
     FileIndex, SearchOptions, is_running_as_admin, load_index, normalize_drive, save_index,
 };
@@ -47,6 +52,17 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value_t = false)]
         trigram: bool,
+    },
+    /// Search inside file contents (regex)
+    Content {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        under: PathBuf,
+        #[arg(long)]
+        ext: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
     /// Keep index up to date from USN Journal
     Watch {
@@ -94,6 +110,12 @@ fn main() -> Result<()> {
         } => run_search(
             index, query, ext, under, glob, dirs_only, files_only, limit, trigram,
         ),
+        Commands::Content {
+            query,
+            under,
+            ext,
+            limit,
+        } => run_content_search(query, under, ext, limit),
         Commands::Watch {
             drive,
             index,
@@ -105,27 +127,34 @@ fn main() -> Result<()> {
 
 fn run_index(drive: &str, output: PathBuf) -> Result<()> {
     require_admin()?;
-    let drive = normalize_drive(drive)?;
+    let drives = parse_drive_list(drive)?;
+    let multi_drive = drives.len() > 1;
     let started = Instant::now();
     println!(
-        "Starting index build on {}. This can take several minutes...",
-        drive
+        "Starting index build on {} drive(s). This can take several minutes...",
+        drives.len()
     );
-    let build_started = Instant::now();
-    let index = FileIndex::build(&drive)?;
-    println!(
-        "MFT/journal scan completed in {:?}. Saving index...",
-        build_started.elapsed()
-    );
-    let save_started = Instant::now();
-    save_index(&index, &output)?;
-    println!("Index persisted in {:?}", save_started.elapsed());
-    println!(
-        "Index generated: {} entries in {:?} -> {}",
-        index.entries.len(),
-        started.elapsed(),
-        output.display()
-    );
+    for drive in drives {
+        let output_path = drive_index_path(&output, &drive, multi_drive);
+        println!("Building index for {}...", drive);
+        let build_started = Instant::now();
+        let index = FileIndex::build(&drive)?;
+        println!(
+            "MFT/journal scan for {} completed in {:?}. Saving index...",
+            drive,
+            build_started.elapsed()
+        );
+        let save_started = Instant::now();
+        save_index(&index, &output_path)?;
+        println!(
+            "Index persisted for {} in {:?} -> {} (entries={})",
+            drive,
+            save_started.elapsed(),
+            output_path.display(),
+            index.entries.len()
+        );
+    }
+    println!("Index build finished in {:?}", started.elapsed());
     Ok(())
 }
 
@@ -160,6 +189,80 @@ fn run_search(
         println!("[{entry_type}] {}", result.path);
     }
     println!("Results: {} in {:?}", results.len(), started.elapsed());
+    Ok(())
+}
+
+fn run_content_search(
+    query: String,
+    under: PathBuf,
+    ext: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    if !under.exists() {
+        return Err(anyhow!("under path does not exist: {}", under.display()));
+    }
+
+    let matcher = RegexMatcherBuilder::new()
+        .case_insensitive(true)
+        .build(&query)
+        .map_err(|err| anyhow!("invalid regex query: {err}"))?;
+    let mut searcher = SearcherBuilder::new().line_number(true).build();
+    let mut outputs = Vec::new();
+    let started = Instant::now();
+    let ext_filter = ext.map(|value| value.trim_start_matches('.').to_ascii_lowercase());
+
+    let walker = WalkBuilder::new(&under).standard_filters(true).build();
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if let Some(required_ext) = &ext_filter {
+            let file_ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase());
+            if file_ext.as_deref() != Some(required_ext.as_str()) {
+                continue;
+            }
+        }
+        if outputs.len() >= limit {
+            break;
+        }
+
+        let display_path = path.display().to_string();
+        if let Err(err) = searcher.search_path(
+            &matcher,
+            path,
+            UTF8(|line_number, line| {
+                if outputs.len() >= limit {
+                    return Ok(false);
+                }
+                outputs.push(format!(
+                    "{}:{}:{}",
+                    display_path,
+                    line_number,
+                    line.trim_end()
+                ));
+                Ok(true)
+            }),
+        ) {
+            let err_text = err.to_string();
+            if err_text.contains("invalid utf-8 sequence") {
+                continue;
+            }
+            return Err(anyhow!("content search failed on {}: {err}", path.display()));
+        }
+    }
+
+    for line in &outputs {
+        println!("{line}");
+    }
+    println!("Content results: {} in {:?}", outputs.len(), started.elapsed());
     Ok(())
 }
 
@@ -228,6 +331,54 @@ fn require_admin() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn parse_drive_list(raw: &str) -> Result<Vec<String>> {
+    let mut drives = Vec::new();
+    let mut seen = HashSet::new();
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = normalize_drive(trimmed)?;
+        if seen.insert(normalized.clone()) {
+            drives.push(normalized);
+        }
+    }
+    if drives.is_empty() {
+        return Err(anyhow!("no valid drives provided"));
+    }
+    Ok(drives)
+}
+
+fn drive_index_path(base: &Path, drive: &str, multi_drive: bool) -> PathBuf {
+    if !multi_drive {
+        return base.to_path_buf();
+    }
+
+    let drive_lower = drive.trim_end_matches(':').to_ascii_lowercase();
+    let ext = base
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("index");
+
+    let file_name = if stem.len() == 1 && stem.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        if ext.is_empty() {
+            drive_lower
+        } else {
+            format!("{drive_lower}.{ext}")
+        }
+    } else if ext.is_empty() {
+        format!("{stem}-{drive_lower}")
+    } else {
+        format!("{stem}-{drive_lower}.{ext}")
+    };
+    base.with_file_name(file_name)
 }
 
 fn run_shell(action: ShellAction) -> Result<()> {
@@ -352,4 +503,24 @@ fn resolve_gui_path(gui_path: Option<PathBuf>) -> Result<PathBuf> {
     Err(anyhow!(
         "rayo-gui.exe not found. Build it or pass --gui-path."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{drive_index_path, parse_drive_list};
+
+    #[test]
+    fn parse_drive_list_supports_csv_and_dedup() {
+        let drives = parse_drive_list("c, D:, c").expect("parse drives");
+        assert_eq!(drives, vec!["C:", "D:"]);
+    }
+
+    #[test]
+    fn drive_index_path_multi_drive_uses_letter_when_base_is_letter() {
+        let base = Path::new("c.rayo");
+        assert_eq!(drive_index_path(base, "C:", true), Path::new("c.rayo"));
+        assert_eq!(drive_index_path(base, "D:", true), Path::new("d.rayo"));
+    }
 }

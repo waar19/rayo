@@ -2,7 +2,8 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -42,6 +43,8 @@ static PIPE_SECURITY_DESCRIPTOR: OnceLock<isize> = OnceLock::new();
 struct Cli {
     #[arg(long, default_value = "C")]
     drive: String,
+    #[arg(long)]
+    drives: Option<String>,
     #[arg(long, default_value = "index.rayo")]
     index: PathBuf,
     #[arg(long, default_value_t = 300)]
@@ -90,26 +93,53 @@ struct ServiceMetrics {
     max_took_ms: u128,
 }
 
+#[derive(Clone)]
+struct DriveState {
+    drive: String,
+    index_path: PathBuf,
+    index: Arc<RwLock<FileIndex>>,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     require_admin()?;
-    let drive = normalize_drive(&cli.drive)?;
-
-    let mut index = load_or_build_index(&drive, &cli.index)?;
-    if cli.trigram {
-        let trigram_started = Instant::now();
-        index.set_trigram_enabled(true);
-        println!("Trigram index enabled in {:?}.", trigram_started.elapsed());
+    let drives = parse_drives(&cli.drive, cli.drives.as_deref())?;
+    let multi_drive = drives.len() > 1;
+    let mut drive_states = Vec::with_capacity(drives.len());
+    for drive in drives {
+        let index_path = drive_index_path(&cli.index, &drive, multi_drive);
+        let mut index = load_or_build_index(&drive, &index_path)?;
+        if cli.trigram {
+            let trigram_started = Instant::now();
+            index.set_trigram_enabled(true);
+            println!(
+                "Trigram index enabled for {} in {:?}.",
+                drive,
+                trigram_started.elapsed()
+            );
+        }
+        save_index(&index, &index_path)
+            .with_context(|| format!("failed to save bootstrap index at {}", index_path.display()))?;
+        println!(
+            "Service bootstrap ready on {} with {} entries ({})",
+            drive,
+            index.entries.len(),
+            index_path.display()
+        );
+        drive_states.push(DriveState {
+            drive,
+            index_path,
+            index: Arc::new(RwLock::new(index)),
+        });
     }
-    save_index(&index, &cli.index)
-        .with_context(|| format!("failed to save bootstrap index at {}", cli.index.display()))?;
-    println!(
-        "Service bootstrap ready on {} with {} entries.",
-        drive,
-        index.entries.len()
-    );
 
-    let index = Arc::new(RwLock::new(index));
+    let drive_states = Arc::new(drive_states);
+    let indexes = Arc::new(
+        drive_states
+            .iter()
+            .map(|state| state.index.clone())
+            .collect::<Vec<_>>(),
+    );
     let metrics = Arc::new(Mutex::new(ServiceMetrics::default()));
     let running = Arc::new(AtomicBool::new(true));
     let running_handler = running.clone();
@@ -118,38 +148,45 @@ fn main() -> Result<()> {
     })
     .context("failed to install Ctrl+C handler")?;
 
-    let watch_index = index.clone();
-    let watch_running = running.clone();
-    let watch_index_path = cli.index.clone();
     let watch_poll = cli.poll_ms.max(50);
     let watch_persist_every = cli.persist_every_changes.max(1);
-    let watch_thread = thread::spawn(move || {
-        run_watch_loop(
-            watch_index,
-            watch_running,
-            watch_index_path,
-            watch_poll,
-            watch_persist_every,
-        );
-    });
+    let mut watch_threads = Vec::new();
+    for state in drive_states.iter() {
+        let watch_index = state.index.clone();
+        let watch_running = running.clone();
+        let watch_index_path = state.index_path.clone();
+        let watch_drive = state.drive.clone();
+        watch_threads.push(thread::spawn(move || {
+            println!("Watch loop started for {watch_drive}");
+            run_watch_loop(
+                watch_index,
+                watch_running,
+                watch_index_path,
+                watch_poll,
+                watch_persist_every,
+            );
+        }));
+    }
 
     let metrics_running = running.clone();
-    let metrics_index = index.clone();
+    let metrics_indexes = indexes.clone();
     let metrics_state = metrics.clone();
     let metrics_interval = Duration::from_secs(cli.metrics_interval_secs.max(5));
     let metrics_thread = thread::spawn(move || {
         run_metrics_reporter(
             metrics_state,
-            metrics_index,
+            metrics_indexes,
             metrics_running,
             metrics_interval,
         );
     });
 
     println!("Named pipe listening on {PIPE_NAME}");
-    let pipe_result = run_pipe_server(index, running.clone(), metrics, cli.default_limit.max(1));
+    let pipe_result = run_pipe_server(indexes, running.clone(), metrics, cli.default_limit.max(1));
     running.store(false, Ordering::SeqCst);
-    let _ = watch_thread.join();
+    for handle in watch_threads {
+        let _ = handle.join();
+    }
     let _ = metrics_thread.join();
     pipe_result
 }
@@ -161,6 +198,56 @@ fn require_admin() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn parse_drives(default_drive: &str, drives_arg: Option<&str>) -> Result<Vec<String>> {
+    let raw = drives_arg.unwrap_or(default_drive);
+    let mut drives = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in raw.split(',') {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let normalized = normalize_drive(trimmed)?;
+        if seen.insert(normalized.clone()) {
+            drives.push(normalized);
+        }
+    }
+    if drives.is_empty() {
+        return Err(anyhow!("no valid drives provided"));
+    }
+    Ok(drives)
+}
+
+fn drive_index_path(base: &Path, drive: &str, multi_drive: bool) -> PathBuf {
+    if !multi_drive {
+        return base.to_path_buf();
+    }
+
+    let drive_lower = drive.trim_end_matches(':').to_ascii_lowercase();
+    let ext = base
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let stem = base
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("index");
+
+    let file_name = if stem.len() == 1 && stem.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        if ext.is_empty() {
+            drive_lower
+        } else {
+            format!("{drive_lower}.{ext}")
+        }
+    } else if ext.is_empty() {
+        format!("{stem}-{drive_lower}")
+    } else {
+        format!("{stem}-{drive_lower}.{ext}")
+    };
+
+    base.with_file_name(file_name)
 }
 
 fn load_or_build_index(drive: &str, index_path: &PathBuf) -> Result<FileIndex> {
@@ -246,7 +333,7 @@ fn run_watch_loop(
 }
 
 fn run_pipe_server(
-    index: Arc<RwLock<FileIndex>>,
+    indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
     running: Arc<AtomicBool>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
@@ -263,12 +350,12 @@ fn run_pipe_server(
             }
         }
 
-        let shared_index = index.clone();
+        let shared_indexes = indexes.clone();
         let shared_metrics = metrics.clone();
         let pipe_raw = pipe.0 as isize;
         thread::spawn(move || {
             let pipe = HANDLE(pipe_raw as *mut c_void);
-            if let Err(err) = handle_pipe_client(pipe, shared_index, shared_metrics, default_limit)
+            if let Err(err) = handle_pipe_client(pipe, shared_indexes, shared_metrics, default_limit)
             {
                 eprintln!("pipe client error: {err:#}");
             }
@@ -326,7 +413,7 @@ fn pipe_security_attributes() -> Result<SECURITY_ATTRIBUTES> {
 
 fn handle_pipe_client(
     pipe: HANDLE,
-    index: Arc<RwLock<FileIndex>>,
+    indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
 ) -> Result<()> {
@@ -362,14 +449,23 @@ fn handle_pipe_client(
         };
 
         let started = Instant::now();
-        let (results, total_entries) = {
+        let query_lower = options.query.to_ascii_lowercase();
+        let mut total_entries = 0usize;
+        let mut merged = Vec::new();
+        for index in indexes.iter() {
             let guard = match index.read() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            total_entries += guard.entries.len();
             options.prefer_trigram = guard.trigram_enabled();
-            (guard.search(&options), guard.entries.len())
-        };
+            merged.extend(guard.search(&options));
+        }
+        merged.sort_by(|a, b| compare_relevance_paths(&a.path, &b.path, &query_lower));
+        if merged.len() > limit {
+            merged.truncate(limit);
+        }
+
         let took_ms = started.elapsed().as_millis();
         if let Ok(mut guard) = metrics.lock() {
             guard.requests_total += 1;
@@ -380,7 +476,7 @@ fn handle_pipe_client(
         let response = QueryResponse {
             took_ms,
             total_entries,
-            results: results
+            results: merged
                 .into_iter()
                 .map(|item| QueryResultDto {
                     path: item.path,
@@ -400,16 +496,19 @@ fn handle_pipe_client(
 
 fn run_metrics_reporter(
     metrics: Arc<Mutex<ServiceMetrics>>,
-    index: Arc<RwLock<FileIndex>>,
+    indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
     running: Arc<AtomicBool>,
     interval: Duration,
 ) {
     while running.load(Ordering::SeqCst) {
         thread::sleep(interval);
-        let entries = match index.read() {
-            Ok(guard) => guard.entries.len(),
-            Err(poisoned) => poisoned.into_inner().entries.len(),
-        };
+        let entries = indexes
+            .iter()
+            .map(|index| match index.read() {
+                Ok(guard) => guard.entries.len(),
+                Err(poisoned) => poisoned.into_inner().entries.len(),
+            })
+            .sum::<usize>();
         let snapshot = match metrics.lock() {
             Ok(guard) => ServiceMetrics {
                 requests_total: guard.requests_total,
@@ -440,6 +539,50 @@ fn run_metrics_reporter(
     }
 }
 
+fn compare_relevance_paths(a: &str, b: &str, query_lower: &str) -> std::cmp::Ordering {
+    path_relevance_key(a, query_lower)
+        .cmp(&path_relevance_key(b, query_lower))
+        .then_with(|| a.cmp(b))
+}
+
+fn path_relevance_key(path: &str, query_lower: &str) -> (u8, usize, usize) {
+    let file_name = path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let starts_with = if file_name.starts_with(query_lower) {
+        0
+    } else {
+        1
+    };
+    let match_pos = file_name.find(query_lower).unwrap_or(usize::MAX);
+    (starts_with, match_pos, path.len())
+}
+
 fn to_utf16_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{compare_relevance_paths, drive_index_path};
+
+    #[test]
+    fn drive_index_path_uses_letter_file_names_for_letter_base() {
+        let base = Path::new("c.rayo");
+        assert_eq!(drive_index_path(base, "C:", true), Path::new("c.rayo"));
+        assert_eq!(drive_index_path(base, "D:", true), Path::new("d.rayo"));
+    }
+
+    #[test]
+    fn compare_relevance_paths_prioritizes_prefix_match() {
+        let query = "ticket";
+        let left = r"C:\src\ticketTrack.log";
+        let right = r"C:\src\my-ticket-notes.log";
+        let ordering = compare_relevance_paths(left, right, query);
+        assert!(ordering.is_lt());
+    }
 }
