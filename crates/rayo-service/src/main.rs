@@ -1,8 +1,8 @@
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -118,8 +118,9 @@ fn main() -> Result<()> {
                 trigram_started.elapsed()
             );
         }
-        save_index(&index, &index_path)
-            .with_context(|| format!("failed to save bootstrap index at {}", index_path.display()))?;
+        save_index(&index, &index_path).with_context(|| {
+            format!("failed to save bootstrap index at {}", index_path.display())
+        })?;
         println!(
             "Service bootstrap ready on {} with {} entries ({})",
             drive,
@@ -355,7 +356,8 @@ fn run_pipe_server(
         let pipe_raw = pipe.0 as isize;
         thread::spawn(move || {
             let pipe = HANDLE(pipe_raw as *mut c_void);
-            if let Err(err) = handle_pipe_client(pipe, shared_indexes, shared_metrics, default_limit)
+            if let Err(err) =
+                handle_pipe_client(pipe, shared_indexes, shared_metrics, default_limit)
             {
                 eprintln!("pipe client error: {err:#}");
             }

@@ -255,14 +255,21 @@ fn run_content_search(
             if err_text.contains("invalid utf-8 sequence") {
                 continue;
             }
-            return Err(anyhow!("content search failed on {}: {err}", path.display()));
+            return Err(anyhow!(
+                "content search failed on {}: {err}",
+                path.display()
+            ));
         }
     }
 
     for line in &outputs {
         println!("{line}");
     }
-    println!("Content results: {} in {:?}", outputs.len(), started.elapsed());
+    println!(
+        "Content results: {} in {:?}",
+        outputs.len(),
+        started.elapsed()
+    );
     Ok(())
 }
 
