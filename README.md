@@ -21,7 +21,7 @@ English | [Español](README.es.md)
 ## Project structure
 
 - `crates/rayo-core`: indexing, search, NTFS/USN integration, persistence.
-- `crates/rayo-cli`: CLI interface (`index`, `search`, `watch`).
+- `crates/rayo-cli`: CLI interface (`index`, `search`, `content`, `watch`).
 - `crates/rayo-service`: elevated background service with live in-memory index and named pipe API.
 - `crates/rayo-gui`: native desktop GUI (`Slint`, Fluent style) with service/fallback search modes.
 
@@ -38,16 +38,25 @@ English | [Español](README.es.md)
 cargo build
 
 # Create index (run terminal as Administrator)
+# Single drive:
 cargo run -p rayo-cli -- index --drive C --output .\c.rayo
+# Multi-drive (generates c.rayo, d.rayo from base output path):
+cargo run -p rayo-cli -- index --drive C,D --output .\c.rayo
 
 # Search
 cargo run -p rayo-cli -- search --index .\c.rayo --query report --ext pdf
+
+# Content search (regex, ripgrep-style)
+cargo run -p rayo-cli -- content --query "Rayo GUI search client" --under . --limit 20
 
 # Keep index updated (run terminal as Administrator)
 cargo run -p rayo-cli -- watch --drive C --index .\c.rayo
 
 # Start background service (run terminal as Administrator)
+# Single drive:
 cargo run -p rayo-service -- --drive C --index .\c.rayo
+# Multi-drive merge:
+cargo run -p rayo-service -- --drives C,D --index .\c.rayo
 
 # Open GUI (tries service first, falls back to local index file)
 cargo run -p rayo-gui -- --index .\c.rayo
@@ -80,8 +89,8 @@ For long queries, trigram mode can reduce first-search latency dramatically:
 # CLI one-off
 cargo run --release -p rayo-cli -- search --index .\c.rayo --query tickettrack --trigram
 
-# Service-wide mode (for clients through named pipe)
-cargo run -p rayo-service -- --drive C --index .\c.rayo --trigram --metrics-interval-secs 30
+# Service-wide mode (for clients through named pipe, including multi-drive)
+cargo run -p rayo-service -- --drives C,D --index .\c.rayo --trigram --metrics-interval-secs 30
 ```
 
 Tradeoff: trigram index uses more memory, but improves long/rare query latency.
@@ -112,10 +121,10 @@ Service + integration validation:
 
 ## Roadmap
 
-### Phase 2
+### Next
 
-- Content search (ripgrep-style) using `grep`/`ignore`.
 - Syntax-aware queries using `tree-sitter`.
+- Bring content search into service and GUI workflows.
 
 ### Phase 3
 
@@ -130,7 +139,7 @@ Service + integration validation:
 
 ## CI and release packaging
 
-- CI pipeline: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `fmt`, `test`, and Windows release builds.
+- CI pipeline: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `fmt`, `test`, Windows release builds, and a non-blocking .NET build for the PowerToys plugin scaffold.
 - Windows release helper: [`scripts/release-windows.ps1`](scripts/release-windows.ps1)
 
 ```powershell
@@ -138,6 +147,12 @@ pwsh .\scripts\release-windows.ps1
 ```
 
 This generates `dist/rayo-windows.zip` with `rayo-cli.exe`, `rayo-service.exe`, `rayo-gui.exe`, and docs.
+
+## PowerToys Run scaffold
+
+- Scaffold location: [`integrations/powertoys-run`](integrations/powertoys-run)
+- Project: `Community.PowerToys.Run.Plugin.Rayo`
+- Current status: named pipe client + DTOs compiled in CI; PowerToys interface wiring is the next step.
 
 ## License
 

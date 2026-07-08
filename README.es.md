@@ -21,7 +21,7 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 ## Estructura del proyecto
 
 - `crates/rayo-core`: indexado, búsqueda, integración NTFS/USN, persistencia.
-- `crates/rayo-cli`: interfaz CLI (`index`, `search`, `watch`).
+- `crates/rayo-cli`: interfaz CLI (`index`, `search`, `content`, `watch`).
 - `crates/rayo-service`: servicio de fondo elevado con índice en memoria y API por named pipe.
 - `crates/rayo-gui`: GUI nativa (`Slint`, estilo Fluent) con búsqueda por servicio o fallback local.
 
@@ -38,16 +38,25 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 cargo build
 
 # Crear índice (terminal como Administrador)
+# Una unidad:
 cargo run -p rayo-cli -- index --drive C --output .\c.rayo
+# Multi-unidad (genera c.rayo, d.rayo desde el path base):
+cargo run -p rayo-cli -- index --drive C,D --output .\c.rayo
 
 # Buscar
 cargo run -p rayo-cli -- search --index .\c.rayo --query report --ext pdf
+
+# Búsqueda de contenido (regex, estilo ripgrep)
+cargo run -p rayo-cli -- content --query "Rayo GUI search client" --under . --limit 20
 
 # Mantener índice actualizado (terminal como Administrador)
 cargo run -p rayo-cli -- watch --drive C --index .\c.rayo
 
 # Levantar servicio de fondo (terminal como Administrador)
+# Una unidad:
 cargo run -p rayo-service -- --drive C --index .\c.rayo
+# Multi-unidad con merge:
+cargo run -p rayo-service -- --drives C,D --index .\c.rayo
 
 # Abrir GUI (intenta servicio, si no fallback al índice local)
 cargo run -p rayo-gui -- --index .\c.rayo
@@ -80,8 +89,8 @@ Para queries largas, el modo trigrama puede reducir mucho la latencia de la prim
 # CLI puntual
 cargo run --release -p rayo-cli -- search --index .\c.rayo --query tickettrack --trigram
 
-# Modo de servicio (clientes por named pipe)
-cargo run -p rayo-service -- --drive C --index .\c.rayo --trigram --metrics-interval-secs 30
+# Modo de servicio (clientes por named pipe, también multi-unidad)
+cargo run -p rayo-service -- --drives C,D --index .\c.rayo --trigram --metrics-interval-secs 30
 ```
 
 Tradeoff: el índice por trigrama usa más RAM, pero acelera consultas largas/poco frecuentes.
@@ -112,10 +121,10 @@ Validación de servicio + integración:
 
 ## Hoja de ruta
 
-### Fase 2
+### Siguiente
 
-- Búsqueda de contenido estilo ripgrep con `grep`/`ignore`.
 - Consultas sintácticas con `tree-sitter`.
+- Llevar búsqueda de contenido al servicio y a la GUI.
 
 ### Fase 3
 
@@ -130,7 +139,7 @@ Validación de servicio + integración:
 
 ## CI y empaquetado de release
 
-- Pipeline de CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) ejecuta `fmt`, `test` y build release en Windows.
+- Pipeline de CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) ejecuta `fmt`, `test`, build release en Windows y build .NET no bloqueante para el scaffold del plugin PowerToys.
 - Helper de empaquetado Windows: [`scripts/release-windows.ps1`](scripts/release-windows.ps1)
 
 ```powershell
@@ -138,6 +147,12 @@ pwsh .\scripts\release-windows.ps1
 ```
 
 Esto genera `dist/rayo-windows.zip` con `rayo-cli.exe`, `rayo-service.exe`, `rayo-gui.exe` y documentación.
+
+## Scaffold de PowerToys Run
+
+- Ubicación: [`integrations/powertoys-run`](integrations/powertoys-run)
+- Proyecto: `Community.PowerToys.Run.Plugin.Rayo`
+- Estado actual: cliente named pipe + DTOs compilados en CI; el siguiente paso es conectar interfaces reales de PowerToys.
 
 ## Licencia
 

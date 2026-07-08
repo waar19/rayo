@@ -1,4 +1,5 @@
 /target
+/dist
 *.rayo
 *.rayo.tmp-*
 *.bin
@@ -6,3 +7,5 @@
 *.err
 elev-check.txt
 rayo_watch_validation*/
+integrations/powertoys-run/bin/
+integrations/powertoys-run/obj/

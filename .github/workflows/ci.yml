@@ -31,3 +31,18 @@ jobs:
           cargo build --release -p rayo-cli
           cargo build --release -p rayo-service
           cargo build --release -p rayo-gui
+
+  powertoys-plugin-scaffold:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build PowerToys plugin scaffold
+        run: dotnet build .\integrations\powertoys-run\Community.PowerToys.Run.Plugin.Rayo.csproj -c Release
