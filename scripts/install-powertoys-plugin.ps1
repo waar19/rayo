@@ -43,6 +43,20 @@ function Test-DotNetDesktopRuntime {
     return ($runtimeLines | Select-String "Microsoft.WindowsDesktop.App 9\.") -ne $null
 }
 
+function Stop-PowerToysIfRunning {
+    param([bool]$ShouldStop)
+    if (-not $ShouldStop) {
+        return $false
+    }
+    $procs = Get-Process -Name "PowerToys" -ErrorAction SilentlyContinue
+    if ($null -eq $procs) {
+        return $false
+    }
+    $procs | Stop-Process -Force
+    Start-Sleep -Milliseconds 700
+    return $true
+}
+
 function Resolve-PluginZipFromRelease {
     param(
         [string]$Repo,
@@ -123,8 +137,14 @@ if (-not $hasDesktopRuntime) {
     throw ".NET Desktop Runtime 9 still not detected. Install it, then rerun installer."
 }
 
+$powerToysWasRunning = Stop-PowerToysIfRunning -ShouldStop $RestartPowerToys
+
 if (Test-Path $pluginRoot) {
-    Remove-Item -Recurse -Force $pluginRoot
+    try {
+        Remove-Item -Recurse -Force $pluginRoot
+    } catch {
+        throw "Plugin directory is locked. Close PowerToys and rerun installer, or use -RestartPowerToys `$true."
+    }
 }
 New-Item -ItemType Directory -Path $pluginRoot -Force | Out-Null
 Expand-Archive -Path $PluginZipPath -DestinationPath $pluginRoot -Force
@@ -132,11 +152,13 @@ Expand-Archive -Path $PluginZipPath -DestinationPath $pluginRoot -Force
 Write-Host "Rayo plugin installed at: $pluginRoot"
 
 if ($RestartPowerToys) {
-    Get-Process -Name "PowerToys" -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Milliseconds 600
     if ($powerToysExe -and (Test-Path $powerToysExe)) {
         Start-Process $powerToysExe | Out-Null
-        Write-Host "PowerToys restarted."
+        if ($powerToysWasRunning) {
+            Write-Host "PowerToys restarted."
+        } else {
+            Write-Host "PowerToys started."
+        }
     }
 }
 
