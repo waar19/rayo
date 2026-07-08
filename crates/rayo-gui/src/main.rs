@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
+use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -36,10 +37,10 @@ struct Cli {
     under: Option<String>,
     #[arg(long, default_value = DEFAULT_PIPE)]
     pipe: String,
-    #[arg(long, default_value_t = 200)]
-    limit: usize,
-    #[arg(long, default_value_t = 10)]
-    debounce_ms: u64,
+    #[arg(long)]
+    limit: Option<usize>,
+    #[arg(long)]
+    debounce_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,9 +112,29 @@ impl PipeClient {
 struct GuiConfig {
     index_path: PathBuf,
     pipe_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GuiSettings {
     under_dir: Option<String>,
+    extension: Option<String>,
+    files_only: bool,
+    directories_only: bool,
     limit: usize,
     debounce_ms: u64,
+}
+
+impl Default for GuiSettings {
+    fn default() -> Self {
+        Self {
+            under_dir: None,
+            extension: None,
+            files_only: false,
+            directories_only: false,
+            limit: 200,
+            debounce_ms: 10,
+        }
+    }
 }
 
 struct UiPayload {
@@ -127,6 +148,71 @@ struct UiPayload {
 struct SearchCommand {
     request_id: u64,
     query: String,
+}
+
+fn normalize_optional_text(input: String) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn sanitize_settings(settings: &mut GuiSettings) {
+    settings.under_dir = settings
+        .under_dir
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    settings.extension = settings
+        .extension
+        .as_ref()
+        .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    settings.limit = settings.limit.clamp(10, 1000);
+    settings.debounce_ms = settings.debounce_ms.clamp(0, 200);
+    if settings.files_only && settings.directories_only {
+        settings.directories_only = false;
+    }
+}
+
+fn settings_path() -> Result<PathBuf> {
+    let app_data = std::env::var("APPDATA").context("APPDATA environment variable is not set")?;
+    Ok(PathBuf::from(app_data).join("rayo").join("settings.json"))
+}
+
+fn load_settings() -> Result<GuiSettings> {
+    let path = settings_path()?;
+    if !path.exists() {
+        return Ok(GuiSettings::default());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read settings file {}", path.display()))?;
+    let mut settings: GuiSettings = serde_json::from_str(&raw)
+        .with_context(|| format!("invalid settings JSON at {}", path.display()))?;
+    sanitize_settings(&mut settings);
+    Ok(settings)
+}
+
+fn save_settings(settings: &GuiSettings) -> Result<()> {
+    let path = settings_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create settings directory {}", parent.display()))?;
+    }
+    let content =
+        serde_json::to_string_pretty(settings).context("failed to serialize settings JSON")?;
+    fs::write(&path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn read_settings(settings: &Arc<RwLock<GuiSettings>>) -> GuiSettings {
+    match settings.read() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 fn apply_payload(ui: &MainWindow, payload: UiPayload, paths: &Arc<Mutex<Vec<String>>>) {
@@ -249,11 +335,13 @@ fn selected_path(ui: &MainWindow, paths: &Arc<Mutex<Vec<String>>>) -> Option<Str
 
 fn run_search(
     config: &GuiConfig,
+    settings_state: &Arc<RwLock<GuiSettings>>,
     fallback_index: &Arc<RwLock<Option<FileIndex>>>,
     query: String,
     pipe_client: &mut Option<PipeClient>,
 ) -> UiPayload {
-    if query.trim().chars().count() < 2 && config.under_dir.is_none() {
+    let settings = read_settings(settings_state);
+    if query.trim().chars().count() < 2 && settings.under_dir.is_none() {
         return UiPayload {
             rows: Vec::new(),
             paths: Vec::new(),
@@ -264,12 +352,12 @@ fn run_search(
 
     let request = QueryRequest {
         query: query.clone(),
-        extension: None,
-        under_dir: config.under_dir.clone(),
+        extension: settings.extension.clone(),
+        under_dir: settings.under_dir.clone(),
         glob: None,
-        directories_only: false,
-        files_only: false,
-        limit: Some(config.limit),
+        directories_only: settings.directories_only,
+        files_only: settings.files_only,
+        limit: Some(settings.limit),
     };
 
     let (raw_results, took_ms, total_entries, mode_text) =
@@ -309,12 +397,12 @@ fn run_search(
                 };
                 let search_results = index.search(&SearchOptions {
                     query,
-                    extension: None,
-                    under_dir: config.under_dir.clone(),
+                    extension: settings.extension.clone(),
+                    under_dir: settings.under_dir.clone(),
                     glob: None,
-                    directories_only: false,
-                    files_only: false,
-                    limit: config.limit,
+                    directories_only: settings.directories_only,
+                    files_only: settings.files_only,
+                    limit: settings.limit,
                 });
                 (
                     search_results
@@ -372,6 +460,7 @@ fn trigger_search(
 fn spawn_search_worker(
     ui_weak: slint::Weak<MainWindow>,
     config: Arc<GuiConfig>,
+    settings_state: Arc<RwLock<GuiSettings>>,
     fallback_index: Arc<RwLock<Option<FileIndex>>>,
     latest_request: Arc<AtomicU64>,
     paths: Arc<Mutex<Vec<String>>>,
@@ -384,7 +473,13 @@ fn spawn_search_worker(
                 command = next;
             }
 
-            let payload = run_search(&config, &fallback_index, command.query, &mut pipe_client);
+            let payload = run_search(
+                &config,
+                &settings_state,
+                &fallback_index,
+                command.query,
+                &mut pipe_client,
+            );
             let request_id = command.request_id;
             let latest_apply = latest_request.clone();
             let paths_apply = paths.clone();
@@ -404,25 +499,56 @@ fn spawn_search_worker(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mut initial_settings = load_settings().unwrap_or_else(|err| {
+        eprintln!("failed to load settings: {err:#}");
+        GuiSettings::default()
+    });
+    if let Some(under) = cli.under {
+        initial_settings.under_dir = normalize_optional_text(under);
+    }
+    if let Some(limit) = cli.limit {
+        initial_settings.limit = limit;
+    }
+    if let Some(debounce_ms) = cli.debounce_ms {
+        initial_settings.debounce_ms = debounce_ms;
+    }
+    sanitize_settings(&mut initial_settings);
+
     let config = Arc::new(GuiConfig {
         index_path: cli.index,
         pipe_name: cli.pipe,
-        under_dir: cli.under,
-        limit: cli.limit.max(1),
-        debounce_ms: cli.debounce_ms,
     });
+    let settings_state = Arc::new(RwLock::new(initial_settings.clone()));
     let fallback_index: Arc<RwLock<Option<FileIndex>>> = Arc::new(RwLock::new(None));
     let latest_request = Arc::new(AtomicU64::new(0));
     let result_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let ui = MainWindow::new().map_err(|err| anyhow!("failed to create GUI: {err}"))?;
     ui.set_under_text(
-        config
+        initial_settings
             .under_dir
             .clone()
             .unwrap_or_else(|| "<none>".to_string())
             .into(),
     );
+    ui.set_settings_under_dir(
+        initial_settings
+            .under_dir
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_settings_extension(
+        initial_settings
+            .extension
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_settings_files_only(initial_settings.files_only);
+    ui.set_settings_directories_only(initial_settings.directories_only);
+    ui.set_settings_limit(initial_settings.limit as i32);
+    ui.set_settings_debounce_ms(initial_settings.debounce_ms as i32);
 
     {
         let preload_config = config.clone();
@@ -469,6 +595,7 @@ fn main() -> Result<()> {
     let search_tx = spawn_search_worker(
         ui.as_weak(),
         config.clone(),
+        settings_state.clone(),
         fallback_index.clone(),
         latest_request.clone(),
         result_paths.clone(),
@@ -477,16 +604,20 @@ fn main() -> Result<()> {
     {
         let ui_weak = ui.as_weak();
         let timer = debounce_timer.clone();
-        let config = config.clone();
+        let settings_state = settings_state.clone();
         let latest_request = latest_request.clone();
         let search_tx = search_tx.clone();
         ui.on_query_edited(move |_text| {
             let ui_weak2 = ui_weak.clone();
             let latest2 = latest_request.clone();
             let search_tx2 = search_tx.clone();
+            let debounce_ms = {
+                let settings = read_settings(&settings_state);
+                settings.debounce_ms
+            };
             timer.borrow_mut().start(
                 TimerMode::SingleShot,
-                Duration::from_millis(config.debounce_ms),
+                Duration::from_millis(debounce_ms),
                 move || {
                     trigger_search(ui_weak2.clone(), latest2.clone(), search_tx2.clone());
                 },
@@ -501,6 +632,78 @@ fn main() -> Result<()> {
         ui.on_search_now(move || {
             trigger_search(ui_weak.clone(), latest_request.clone(), search_tx.clone());
         });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let settings_state = settings_state.clone();
+        ui.on_open_settings(move || {
+            let settings = read_settings(&settings_state);
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_settings_under_dir(settings.under_dir.clone().unwrap_or_default().into());
+                ui.set_settings_extension(settings.extension.clone().unwrap_or_default().into());
+                ui.set_settings_files_only(settings.files_only);
+                ui.set_settings_directories_only(settings.directories_only);
+                ui.set_settings_limit(settings.limit as i32);
+                ui.set_settings_debounce_ms(settings.debounce_ms as i32);
+                ui.set_show_settings(true);
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_cancel_settings(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_show_settings(false);
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let settings_state = settings_state.clone();
+        let latest_request = latest_request.clone();
+        let search_tx = search_tx.clone();
+        ui.on_save_settings(
+            move |under_dir, extension, files_only, directories_only, limit, debounce_ms| {
+                let mut next = GuiSettings {
+                    under_dir: normalize_optional_text(under_dir.to_string()),
+                    extension: normalize_optional_text(extension.to_string()),
+                    files_only,
+                    directories_only,
+                    limit: limit.max(0) as usize,
+                    debounce_ms: debounce_ms.max(0) as u64,
+                };
+                sanitize_settings(&mut next);
+
+                {
+                    let mut guard = match settings_state.write() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    *guard = next.clone();
+                }
+
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_under_text(
+                        next.under_dir
+                            .clone()
+                            .unwrap_or_else(|| "<none>".to_string())
+                            .into(),
+                    );
+                    ui.set_show_settings(false);
+                    match save_settings(&next) {
+                        Ok(_) => ui.set_status_text("Settings saved.".into()),
+                        Err(err) => {
+                            ui.set_status_text(format!("Failed to save settings: {err}").into())
+                        }
+                    }
+                }
+
+                trigger_search(ui_weak.clone(), latest_request.clone(), search_tx.clone());
+            },
+        );
     }
 
     {

@@ -1,4 +1,4 @@
-import { Button, LineEdit, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, SpinBox, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
 
 export struct ResultRow {
     kind: string,
@@ -18,9 +18,19 @@ export component MainWindow inherits Window {
     in-out property <string> under-text: "<none>";
     in-out property <int> selected-index: -1;
     in-out property <[ResultRow]> results: [];
+    in-out property <bool> show-settings: false;
+    in-out property <string> settings-under-dir: "";
+    in-out property <string> settings-extension: "";
+    in-out property <bool> settings-files-only: false;
+    in-out property <bool> settings-directories-only: false;
+    in-out property <int> settings-limit: 200;
+    in-out property <int> settings-debounce-ms: 10;
 
     callback query-edited(string);
     callback search-now();
+    callback open-settings();
+    callback save-settings(string, string, bool, bool, int, int);
+    callback cancel-settings();
     callback select-row(int);
     callback activate-row(int);
     callback open-selected();
@@ -65,6 +75,12 @@ export component MainWindow inherits Window {
                     text: "Search";
                     horizontal-stretch: 0;
                     clicked => { root.search-now(); }
+                }
+
+                Button {
+                    text: "Settings";
+                    horizontal-stretch: 0;
+                    clicked => { root.open-settings(); }
                 }
 
                 Text {
@@ -137,6 +153,130 @@ export component MainWindow inherits Window {
                             }
                             double-clicked => {
                                 root.activate-row(idx);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if root.show-settings : Rectangle {
+                background: #111317;
+
+                Rectangle {
+                    x: 16px;
+                    y: 16px;
+                    width: parent.width - 32px;
+                    height: parent.height - 32px;
+                    border-color: #2a2f36;
+                    border-width: 1px;
+                    border-radius: 8px;
+                    background: #171a21;
+
+                    ScrollView {
+                        VerticalBox {
+                            spacing: 10px;
+                            padding: 14px;
+
+                            Text {
+                                text: "Settings";
+                                color: #d7e0f0;
+                                font-size: 18px;
+                                font-weight: 600;
+                            }
+
+                            Text {
+                                text: "Search in folder";
+                                color: #8fa4bf;
+                                font-size: 12px;
+                            }
+                            LineEdit {
+                                text <=> root.settings-under-dir;
+                                placeholder-text: "Example: C:\\src";
+                            }
+
+                            Text {
+                                text: "Extension filter";
+                                color: #8fa4bf;
+                                font-size: 12px;
+                            }
+                            LineEdit {
+                                text <=> root.settings-extension;
+                                placeholder-text: "Example: pdf";
+                            }
+
+                            HorizontalBox {
+                                spacing: 14px;
+                                CheckBox {
+                                    text: "Files only";
+                                    checked <=> root.settings-files-only;
+                                    toggled => {
+                                        if (self.checked) {
+                                            root.settings-directories-only = false;
+                                        }
+                                    }
+                                }
+                                CheckBox {
+                                    text: "Folders only";
+                                    checked <=> root.settings-directories-only;
+                                    toggled => {
+                                        if (self.checked) {
+                                            root.settings-files-only = false;
+                                        }
+                                    }
+                                }
+                            }
+
+                            Text {
+                                text: "Max results";
+                                color: #8fa4bf;
+                                font-size: 12px;
+                            }
+                            SpinBox {
+                                value <=> root.settings-limit;
+                                minimum: 10;
+                                maximum: 1000;
+                                step-size: 10;
+                            }
+
+                            Text {
+                                text: "Typing delay (ms)";
+                                color: #8fa4bf;
+                                font-size: 12px;
+                            }
+                            SpinBox {
+                                value <=> root.settings-debounce-ms;
+                                minimum: 0;
+                                maximum: 200;
+                                step-size: 5;
+                            }
+
+                            Rectangle {
+                                height: 1px;
+                                background: #2a2f36;
+                            }
+
+                            HorizontalBox {
+                                spacing: 8px;
+                                Rectangle { horizontal-stretch: 1; }
+                                Button {
+                                    text: "Cancel";
+                                    horizontal-stretch: 0;
+                                    clicked => { root.cancel-settings(); }
+                                }
+                                Button {
+                                    text: "Save";
+                                    horizontal-stretch: 0;
+                                    clicked => {
+                                        root.save-settings(
+                                            root.settings-under-dir,
+                                            root.settings-extension,
+                                            root.settings-files-only,
+                                            root.settings-directories-only,
+                                            root.settings-limit,
+                                            root.settings-debounce-ms
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
