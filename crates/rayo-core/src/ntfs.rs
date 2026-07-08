@@ -91,7 +91,6 @@ pub fn enumerate_mft(drive: &str) -> Result<MftSnapshot> {
                 FileEntry {
                     frn,
                     parent_frn,
-                    name_lower: name.to_ascii_lowercase(),
                     name,
                     attributes: record.FileAttributes,
                 },
@@ -172,7 +171,6 @@ pub fn collect_changes(drive: &str, journal_id: u64, start_usn: i64) -> Result<J
                 events.push(JournalChange::Upsert(FileEntry {
                     frn: record.FileReferenceNumber,
                     parent_frn: record.ParentFileReferenceNumber,
-                    name_lower: name.to_ascii_lowercase(),
                     name,
                     attributes: record.FileAttributes,
                 }));

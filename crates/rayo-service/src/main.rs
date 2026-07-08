@@ -1,14 +1,14 @@
+use std::ffi::c_void;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
 use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::ffi::c_void;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -33,7 +33,11 @@ const PIPE_SDDL: &str = "D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)";
 static PIPE_SECURITY_DESCRIPTOR: OnceLock<isize> = OnceLock::new();
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Background Rayo service with live index and named pipe queries")]
+#[command(
+    author,
+    version,
+    about = "Background Rayo service with live index and named pipe queries"
+)]
 struct Cli {
     #[arg(long, default_value = "C")]
     drive: String,
@@ -284,7 +288,11 @@ fn pipe_security_attributes() -> Result<SECURITY_ATTRIBUTES> {
     })
 }
 
-fn handle_pipe_client(pipe: HANDLE, index: Arc<RwLock<FileIndex>>, default_limit: usize) -> Result<()> {
+fn handle_pipe_client(
+    pipe: HANDLE,
+    index: Arc<RwLock<FileIndex>>,
+    default_limit: usize,
+) -> Result<()> {
     let owned = unsafe { OwnedHandle::from_raw_handle(pipe.0 as *mut _) };
     let mut stream = File::from(owned);
     let mut reader = BufReader::new(
@@ -293,51 +301,54 @@ fn handle_pipe_client(pipe: HANDLE, index: Arc<RwLock<FileIndex>>, default_limit
             .context("failed to clone client stream for read")?,
     );
     let mut request_line = String::new();
-    let read = reader
-        .read_line(&mut request_line)
-        .context("failed to read request line")?;
-    if read == 0 {
-        return Ok(());
-    }
+    loop {
+        request_line.clear();
+        let read = reader
+            .read_line(&mut request_line)
+            .context("failed to read request line")?;
+        if read == 0 {
+            break;
+        }
 
-    let request: QueryRequest =
-        serde_json::from_str(request_line.trim_end()).context("invalid JSON request")?;
-    let limit = request.limit.unwrap_or(default_limit).max(1);
-    let options = SearchOptions {
-        query: request.query,
-        extension: request.extension,
-        under_dir: request.under_dir,
-        glob: request.glob,
-        directories_only: request.directories_only,
-        files_only: request.files_only,
-        limit,
-    };
-
-    let started = Instant::now();
-    let (results, total_entries) = {
-        let guard = match index.read() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
+        let request: QueryRequest =
+            serde_json::from_str(request_line.trim_end()).context("invalid JSON request")?;
+        let limit = request.limit.unwrap_or(default_limit).max(1);
+        let options = SearchOptions {
+            query: request.query,
+            extension: request.extension,
+            under_dir: request.under_dir,
+            glob: request.glob,
+            directories_only: request.directories_only,
+            files_only: request.files_only,
+            limit,
         };
-        (guard.search(&options), guard.entries.len())
-    };
-    let response = QueryResponse {
-        took_ms: started.elapsed().as_millis(),
-        total_entries,
-        results: results
-            .into_iter()
-            .map(|item| QueryResultDto {
-                path: item.path,
-                is_directory: item.is_directory,
-            })
-            .collect(),
-    };
 
-    serde_json::to_writer(&mut stream, &response).context("failed to serialize response")?;
-    stream
-        .write_all(b"\n")
-        .context("failed to write response terminator")?;
-    stream.flush().context("failed to flush response")?;
+        let started = Instant::now();
+        let (results, total_entries) = {
+            let guard = match index.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            (guard.search(&options), guard.entries.len())
+        };
+        let response = QueryResponse {
+            took_ms: started.elapsed().as_millis(),
+            total_entries,
+            results: results
+                .into_iter()
+                .map(|item| QueryResultDto {
+                    path: item.path,
+                    is_directory: item.is_directory,
+                })
+                .collect(),
+        };
+
+        serde_json::to_writer(&mut stream, &response).context("failed to serialize response")?;
+        stream
+            .write_all(b"\n")
+            .context("failed to write response terminator")?;
+        stream.flush().context("failed to flush response")?;
+    }
     Ok(())
 }
 

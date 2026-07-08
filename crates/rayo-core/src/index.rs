@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
-use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use memchr::memmem::Finder;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
 use crate::ntfs::{collect_changes, enumerate_mft, normalize_drive};
@@ -14,10 +15,6 @@ pub struct FileEntry {
     pub frn: u64,
     pub parent_frn: u64,
     pub name: String,
-    // Cached lowercase name for fast case-insensitive matching in full scans.
-    // Skipped from persistence to keep index files backwards-compatible.
-    #[serde(skip)]
-    pub name_lower: String,
     pub attributes: u32,
 }
 
@@ -25,9 +22,169 @@ impl FileEntry {
     pub fn is_directory(&self) -> bool {
         (self.attributes & 0x10) != 0
     }
+}
 
-    pub fn rebuild_lowercase_cache(&mut self) {
-        self.name_lower = self.name.to_ascii_lowercase();
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SearchArena {
+    names: Vec<u8>,
+    offsets: Vec<u32>,
+    frns: Vec<u64>,
+    dirs: Vec<bool>,
+    tombstones: Vec<bool>,
+    tombstone_count: usize,
+    slot_by_frn: HashMap<u64, usize>,
+}
+
+impl SearchArena {
+    fn from_entries<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Self {
+        let mut arena = Self::default();
+        for entry in entries {
+            arena.append_entry(entry);
+        }
+        arena
+    }
+
+    fn append_entry(&mut self, entry: &FileEntry) {
+        let start = self.names.len();
+        if start > u32::MAX as usize {
+            return;
+        }
+
+        self.offsets.push(start as u32);
+        self.names
+            .extend(entry.name.bytes().map(|byte| byte.to_ascii_lowercase()));
+        self.names.push(0);
+        self.frns.push(entry.frn);
+        self.dirs.push(entry.is_directory());
+        self.tombstones.push(false);
+
+        let slot = self.frns.len() - 1;
+        self.slot_by_frn.insert(entry.frn, slot);
+    }
+
+    fn delete_frn(&mut self, frn: u64) {
+        let Some(slot) = self.slot_by_frn.remove(&frn) else {
+            return;
+        };
+
+        if !self.tombstones.get(slot).copied().unwrap_or(true) {
+            self.tombstones[slot] = true;
+            self.tombstone_count += 1;
+        }
+    }
+
+    fn upsert_entry(&mut self, entry: &FileEntry) {
+        self.delete_frn(entry.frn);
+        self.append_entry(entry);
+    }
+
+    fn should_compact(&self) -> bool {
+        self.frns.len() >= 1024 && self.tombstone_count.saturating_mul(10) >= self.frns.len()
+    }
+
+    fn live_slots(&self) -> usize {
+        self.frns.len().saturating_sub(self.tombstone_count)
+    }
+
+    fn candidate_frns(&self, query_lower: &str, max_candidates: usize) -> Vec<u64> {
+        if max_candidates == 0 || self.frns.is_empty() {
+            return Vec::new();
+        }
+
+        if query_lower.is_empty() {
+            let mut results = Vec::with_capacity(max_candidates.min(self.live_slots()));
+            for (slot, frn) in self.frns.iter().enumerate() {
+                if self.tombstones.get(slot).copied().unwrap_or(true) {
+                    continue;
+                }
+                results.push(*frn);
+                if results.len() >= max_candidates {
+                    break;
+                }
+            }
+            return results;
+        }
+
+        let query = query_lower.as_bytes();
+        if query.contains(&0) {
+            return Vec::new();
+        }
+
+        let chunk_target = rayon::current_num_threads().max(1) * 2;
+        let slots_per_chunk = self.frns.len().div_ceil(chunk_target).max(1);
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+        while start < self.frns.len() {
+            let end = (start + slots_per_chunk).min(self.frns.len());
+            chunks.push((start, end));
+            start = end;
+        }
+
+        let chunk_results: Vec<Vec<u64>> = chunks
+            .into_par_iter()
+            .map(|(start_slot, end_slot)| {
+                let finder = Finder::new(query);
+                let start_byte = self.offsets[start_slot] as usize;
+                let end_byte = if end_slot < self.offsets.len() {
+                    self.offsets[end_slot] as usize
+                } else {
+                    self.names.len()
+                };
+
+                let slice = &self.names[start_byte..end_byte];
+                let mut matches = Vec::new();
+                let mut slot = start_slot;
+                let mut next_slot_start = if slot + 1 < self.offsets.len() {
+                    self.offsets[slot + 1] as usize
+                } else {
+                    self.names.len()
+                };
+                let mut last_emitted = None;
+
+                for relative in finder.find_iter(slice) {
+                    let global = start_byte + relative;
+                    while slot + 1 < end_slot && global >= next_slot_start {
+                        slot += 1;
+                        next_slot_start = if slot + 1 < self.offsets.len() {
+                            self.offsets[slot + 1] as usize
+                        } else {
+                            self.names.len()
+                        };
+                    }
+
+                    if slot >= end_slot {
+                        break;
+                    }
+                    if self.tombstones.get(slot).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    if last_emitted == Some(slot) {
+                        continue;
+                    }
+
+                    matches.push(self.frns[slot]);
+                    last_emitted = Some(slot);
+                    if matches.len() >= max_candidates {
+                        break;
+                    }
+                }
+
+                matches
+            })
+            .collect();
+
+        let mut merged = Vec::with_capacity(max_candidates.min(self.live_slots()));
+        for mut chunk in chunk_results {
+            if merged.len() >= max_candidates {
+                break;
+            }
+            let left = max_candidates - merged.len();
+            if chunk.len() > left {
+                chunk.truncate(left);
+            }
+            merged.extend(chunk);
+        }
+        merged
     }
 }
 
@@ -38,6 +195,8 @@ pub struct FileIndex {
     pub journal_id: u64,
     pub next_usn: i64,
     pub indexed_at_epoch_secs: u64,
+    #[serde(skip, default)]
+    pub(crate) search_arena: SearchArena,
 }
 
 const NTFS_FILE_REFERENCE_INDEX_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -56,8 +215,9 @@ impl FileIndex {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            search_arena: SearchArena::default(),
         };
-        index.rebuild_lowercase_cache();
+        index.rebuild_search_arena();
         Ok(index)
     }
 
@@ -66,24 +226,28 @@ impl FileIndex {
         for change in &changes.events {
             match change {
                 JournalChange::Upsert(entry) => {
-                    let mut cached = entry.clone();
-                    cached.rebuild_lowercase_cache();
+                    let cached = entry.clone();
                     self.entries.insert(cached.frn, cached);
+                    if let Some(updated) = self.entries.get(&entry.frn) {
+                        self.search_arena.upsert_entry(updated);
+                    }
                 }
                 JournalChange::Delete(frn) => {
                     self.entries.remove(frn);
+                    self.search_arena.delete_frn(*frn);
                 }
             }
         }
         self.next_usn = changes.next_usn;
         self.journal_id = changes.journal_id;
+        if self.search_arena.should_compact() {
+            self.rebuild_search_arena();
+        }
         Ok(changes.events.len())
     }
 
-    pub fn rebuild_lowercase_cache(&mut self) {
-        for entry in self.entries.values_mut() {
-            entry.rebuild_lowercase_cache();
-        }
+    pub fn rebuild_search_arena(&mut self) {
+        self.search_arena = SearchArena::from_entries(self.entries.values());
     }
 
     pub fn resolve_path(&self, frn: u64) -> Option<String> {
@@ -130,6 +294,7 @@ impl FileIndex {
     pub fn search(&self, options: &SearchOptions) -> Vec<SearchResult> {
         let normalized_query = options.query.to_ascii_lowercase();
         let limit = options.limit.max(1);
+        let candidate_limit = limit.saturating_mul(8).max(limit);
         let ext = options
             .extension
             .as_ref()
@@ -143,60 +308,55 @@ impl FileIndex {
             .as_ref()
             .and_then(|pattern| build_glob(pattern).ok());
 
-        let mut results: Vec<SearchResult> = self
-            .entries
-            .par_iter()
-            .filter_map(|(_, entry)| {
-                let matches_query = if entry.name_lower.is_empty() {
-                    contains_ignore_ascii_case(&entry.name, &normalized_query)
-                } else {
-                    entry.name_lower.contains(&normalized_query)
-                };
-                if !matches_query {
-                    return None;
+        let mut results = Vec::new();
+        for frn in self
+            .search_arena
+            .candidate_frns(&normalized_query, candidate_limit)
+        {
+            let Some(entry) = self.entries.get(&frn) else {
+                continue;
+            };
+            if options.directories_only && !entry.is_directory() {
+                continue;
+            }
+            if options.files_only && entry.is_directory() {
+                continue;
+            }
+            if let Some(required_ext) = &ext {
+                let ext_matches = Path::new(&entry.name)
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case(required_ext))
+                    .unwrap_or(false);
+                if !ext_matches {
+                    continue;
                 }
-                if options.directories_only && !entry.is_directory() {
-                    return None;
-                }
-                if options.files_only && entry.is_directory() {
-                    return None;
-                }
-                if let Some(required_ext) = &ext {
-                    let ext_matches = Path::new(&entry.name)
-                        .extension()
-                        .and_then(|x| x.to_str())
-                        .map(|x| x.eq_ignore_ascii_case(required_ext))
-                        .unwrap_or(false);
-                    if !ext_matches {
-                        return None;
-                    }
-                }
+            }
 
-                let path = self.resolve_path(entry.frn)?;
-                let path_lower = path.to_ascii_lowercase();
-                if let Some(under_matcher) = &under {
-                    if path_lower != under_matcher.exact
-                        && !path_lower.starts_with(&under_matcher.prefix)
-                    {
-                        return None;
-                    }
+            let Some(path) = self.resolve_path(entry.frn) else {
+                continue;
+            };
+            let path_lower = path.to_ascii_lowercase();
+            if let Some(under_matcher) = &under {
+                if path_lower != under_matcher.exact
+                    && !path_lower.starts_with(&under_matcher.prefix)
+                {
+                    continue;
                 }
-                if let Some(matcher) = &glob_matcher {
-                    let normalized_glob_path = path.replace('\\', "/");
-                    if !matcher.is_match(&normalized_glob_path) {
-                        return None;
-                    }
+            }
+            if let Some(matcher) = &glob_matcher {
+                let normalized_glob_path = path.replace('\\', "/");
+                if !matcher.is_match(&normalized_glob_path) {
+                    continue;
                 }
+            }
 
-                Some(SearchResult {
-                    frn: entry.frn,
-                    path,
-                    is_directory: entry.is_directory(),
-                })
-            })
-            // Early-stop once we have enough matches to keep latency low while typing.
-            .take_any(limit)
-            .collect();
+            results.push(SearchResult {
+                frn: entry.frn,
+                path,
+                is_directory: entry.is_directory(),
+            });
+        }
 
         // Sort only the small candidate set by perceived relevance.
         results.sort_by(|a, b| compare_relevance(a, b, &normalized_query));
@@ -217,22 +377,6 @@ fn build_glob(pattern: &str) -> Result<GlobMatcher> {
         .build()
         .with_context(|| format!("invalid glob: {pattern}"))?;
     Ok(glob.compile_matcher())
-}
-
-fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-
-    let haystack = haystack.as_bytes();
-    let needle = needle_lower.as_bytes();
-    if needle.len() > haystack.len() {
-        return false;
-    }
-
-    haystack
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn compare_relevance(a: &SearchResult, b: &SearchResult, query_lower: &str) -> std::cmp::Ordering {
@@ -329,14 +473,51 @@ pub struct MftSnapshot {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{FileEntry, FileIndex, SearchOptions, contains_ignore_ascii_case};
+    use super::{FileEntry, FileIndex, SearchArena, SearchOptions};
 
     #[test]
-    fn contains_ignore_ascii_case_handles_ascii_cases() {
-        assert!(contains_ignore_ascii_case("ReportClient.exe", "report"));
-        assert!(contains_ignore_ascii_case("anything", ""));
-        assert!(!contains_ignore_ascii_case("abc", "abcdef"));
-        assert!(!contains_ignore_ascii_case("kernel32.dll", "report"));
+    fn search_arena_tombstones_and_upserts() {
+        let original = FileEntry {
+            frn: 10,
+            parent_frn: 5,
+            name: "report.txt".to_string(),
+            attributes: 0,
+        };
+        let replacement = FileEntry {
+            frn: 10,
+            parent_frn: 5,
+            name: "report-final.txt".to_string(),
+            attributes: 0,
+        };
+
+        let mut arena = SearchArena::default();
+        arena.upsert_entry(&original);
+        assert_eq!(arena.candidate_frns("report", 10), vec![10]);
+
+        arena.delete_frn(10);
+        assert!(arena.candidate_frns("report", 10).is_empty());
+
+        arena.upsert_entry(&replacement);
+        assert_eq!(arena.candidate_frns("final", 10), vec![10]);
+    }
+
+    #[test]
+    fn search_arena_does_not_match_across_name_boundary() {
+        let mut arena = SearchArena::default();
+        arena.upsert_entry(&FileEntry {
+            frn: 1,
+            parent_frn: 1,
+            name: "abc".to_string(),
+            attributes: 0,
+        });
+        arena.upsert_entry(&FileEntry {
+            frn: 2,
+            parent_frn: 1,
+            name: "def".to_string(),
+            attributes: 0,
+        });
+
+        assert!(arena.candidate_frns("cd", 10).is_empty());
     }
 
     #[test]
@@ -348,7 +529,6 @@ mod tests {
                 frn: 1,
                 parent_frn: 1,
                 name: "\\".to_string(),
-                name_lower: "\\".to_string(),
                 attributes: 0x10,
             },
         );
@@ -358,7 +538,6 @@ mod tests {
                 frn: 2,
                 parent_frn: 1,
                 name: "src".to_string(),
-                name_lower: "src".to_string(),
                 attributes: 0x10,
             },
         );
@@ -368,18 +547,19 @@ mod tests {
                 frn: 3,
                 parent_frn: 2,
                 name: "main.rs".to_string(),
-                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );
 
-        let index = FileIndex {
+        let mut index = FileIndex {
             drive: "C:".to_string(),
             entries,
             journal_id: 1,
             next_usn: 0,
             indexed_at_epoch_secs: 0,
+            search_arena: SearchArena::default(),
         };
+        index.rebuild_search_arena();
 
         let results = index.search(&SearchOptions {
             query: "main".to_string(),
@@ -404,7 +584,6 @@ mod tests {
                 frn: 2,
                 parent_frn: 5,
                 name: "src".to_string(),
-                name_lower: "src".to_string(),
                 attributes: 0x10,
             },
         );
@@ -414,18 +593,19 @@ mod tests {
                 frn: 3,
                 parent_frn: 2,
                 name: "main.rs".to_string(),
-                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );
 
-        let index = FileIndex {
+        let mut index = FileIndex {
             drive: "C:".to_string(),
             entries,
             journal_id: 1,
             next_usn: 0,
             indexed_at_epoch_secs: 0,
+            search_arena: SearchArena::default(),
         };
+        index.rebuild_search_arena();
 
         assert_eq!(index.resolve_path(3), Some("C:\\src\\main.rs".to_string()));
     }
@@ -439,7 +619,6 @@ mod tests {
                 frn: 1,
                 parent_frn: 1,
                 name: "\\".to_string(),
-                name_lower: "\\".to_string(),
                 attributes: 0x10,
             },
         );
@@ -449,7 +628,6 @@ mod tests {
                 frn: 2,
                 parent_frn: 1,
                 name: "src".to_string(),
-                name_lower: "src".to_string(),
                 attributes: 0x10,
             },
         );
@@ -459,7 +637,6 @@ mod tests {
                 frn: 3,
                 parent_frn: 2,
                 name: "main.rs".to_string(),
-                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );
@@ -469,7 +646,6 @@ mod tests {
                 frn: 4,
                 parent_frn: 1,
                 name: "src2".to_string(),
-                name_lower: "src2".to_string(),
                 attributes: 0x10,
             },
         );
@@ -479,18 +655,19 @@ mod tests {
                 frn: 5,
                 parent_frn: 4,
                 name: "main.rs".to_string(),
-                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );
 
-        let index = FileIndex {
+        let mut index = FileIndex {
             drive: "C:".to_string(),
             entries,
             journal_id: 1,
             next_usn: 0,
             indexed_at_epoch_secs: 0,
+            search_arena: SearchArena::default(),
         };
+        index.rebuild_search_arena();
 
         let results = index.search(&SearchOptions {
             query: "main".to_string(),

@@ -52,7 +52,7 @@ pub fn load_index(path: impl AsRef<Path>) -> Result<FileIndex> {
     let reader = BufReader::new(file);
     let mut index: FileIndex = bincode::deserialize_from(reader)
         .with_context(|| format!("failed to deserialize index at {}", path.display()))?;
-    index.rebuild_lowercase_cache();
+    index.rebuild_search_arena();
     Ok(index)
 }
 
@@ -75,6 +75,8 @@ mod tests {
 
     use crate::{FileEntry, FileIndex};
 
+    use super::super::index::SearchArena;
+
     use super::{load_index, save_index};
 
     #[test]
@@ -86,17 +88,18 @@ mod tests {
                 frn: 10,
                 parent_frn: 5,
                 name: "demo.txt".to_string(),
-                name_lower: "demo.txt".to_string(),
                 attributes: 0,
             },
         );
-        let index = FileIndex {
+        let mut index = FileIndex {
             drive: "C:".to_string(),
             entries,
             journal_id: 77,
             next_usn: 123,
             indexed_at_epoch_secs: 999,
+            search_arena: SearchArena::default(),
         };
+        index.rebuild_search_arena();
 
         let path = std::env::temp_dir().join("rayo-roundtrip-test.bin");
         save_index(&index, &path).expect("save");
@@ -117,7 +120,6 @@ mod tests {
                 frn: 1,
                 parent_frn: 1,
                 name: "old.txt".to_string(),
-                name_lower: "old.txt".to_string(),
                 attributes: 0,
             },
         );
@@ -127,7 +129,9 @@ mod tests {
             journal_id: 10,
             next_usn: 20,
             indexed_at_epoch_secs: 30,
+            search_arena: SearchArena::default(),
         };
+        index.rebuild_search_arena();
 
         let path = std::env::temp_dir().join("rayo-atomic-save-test.rayo");
         save_index(&index, &path).expect("save old");
@@ -138,10 +142,10 @@ mod tests {
                 frn: 2,
                 parent_frn: 1,
                 name: "new.txt".to_string(),
-                name_lower: "new.txt".to_string(),
                 attributes: 0,
             },
         );
+        index.rebuild_search_arena();
         index.journal_id = 11;
         save_index(&index, &path).expect("save new");
 

@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,7 +38,7 @@ struct Cli {
     pipe: String,
     #[arg(long, default_value_t = 200)]
     limit: usize,
-    #[arg(long, default_value_t = 25)]
+    #[arg(long, default_value_t = 10)]
     debounce_ms: u64,
 }
 
@@ -64,6 +66,47 @@ struct QueryResponse {
     results: Vec<QueryResultDto>,
 }
 
+struct PipeClient {
+    stream: File,
+    reader: BufReader<File>,
+}
+
+impl PipeClient {
+    fn connect(pipe_name: &str) -> Result<Self> {
+        let stream = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe_name)
+            .with_context(|| format!("failed to connect service pipe {pipe_name}"))?;
+        let reader = BufReader::new(
+            stream
+                .try_clone()
+                .context("failed to clone stream for pipe reader")?,
+        );
+        Ok(Self { stream, reader })
+    }
+
+    fn query(&mut self, request: &QueryRequest) -> Result<QueryResponse> {
+        serde_json::to_writer(&mut self.stream, request).context("failed to serialize request")?;
+        self.stream
+            .write_all(b"\n")
+            .context("failed to write request terminator")?;
+        self.stream.flush().context("failed to flush request")?;
+
+        let mut line = String::new();
+        let read = self
+            .reader
+            .read_line(&mut line)
+            .context("failed to read response line")?;
+        if read == 0 {
+            return Err(anyhow!("service closed pipe without response"));
+        }
+        let response: QueryResponse =
+            serde_json::from_str(line.trim_end()).context("invalid response JSON")?;
+        Ok(response)
+    }
+}
+
 #[derive(Clone)]
 struct GuiConfig {
     index_path: PathBuf,
@@ -80,6 +123,12 @@ struct UiPayload {
     mode_text: String,
 }
 
+#[derive(Debug)]
+struct SearchCommand {
+    request_id: u64,
+    query: String,
+}
+
 fn apply_payload(ui: &MainWindow, payload: UiPayload, paths: &Arc<Mutex<Vec<String>>>) {
     let model = Rc::new(VecModel::from(payload.rows));
     ui.set_results(ModelRc::from(model));
@@ -91,29 +140,29 @@ fn apply_payload(ui: &MainWindow, payload: UiPayload, paths: &Arc<Mutex<Vec<Stri
     }
 }
 
-fn query_service(pipe_name: &str, request: &QueryRequest) -> Result<QueryResponse> {
-    let mut stream = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pipe_name)
-        .with_context(|| format!("failed to connect service pipe {pipe_name}"))?;
-    serde_json::to_writer(&mut stream, request).context("failed to serialize request")?;
-    stream
-        .write_all(b"\n")
-        .context("failed to write request terminator")?;
-    stream.flush().context("failed to flush request")?;
-
-    let mut line = String::new();
-    let mut reader = BufReader::new(stream);
-    let read = reader
-        .read_line(&mut line)
-        .context("failed to read response line")?;
-    if read == 0 {
-        return Err(anyhow!("service closed pipe without response"));
+fn query_service(
+    pipe_name: &str,
+    request: &QueryRequest,
+    pipe_client: &mut Option<PipeClient>,
+) -> Result<QueryResponse> {
+    if pipe_client.is_none() {
+        *pipe_client = Some(PipeClient::connect(pipe_name)?);
     }
-    let response: QueryResponse =
-        serde_json::from_str(line.trim_end()).context("invalid response JSON")?;
-    Ok(response)
+
+    if let Some(client) = pipe_client.as_mut() {
+        match client.query(request) {
+            Ok(response) => return Ok(response),
+            Err(_) => {
+                *pipe_client = None;
+            }
+        }
+    }
+
+    *pipe_client = Some(PipeClient::connect(pipe_name)?);
+    let Some(client) = pipe_client.as_mut() else {
+        return Err(anyhow!("failed to initialize named pipe client"));
+    };
+    client.query(request)
 }
 
 fn can_connect_pipe(pipe_name: &str) -> bool {
@@ -202,6 +251,7 @@ fn run_search(
     config: &GuiConfig,
     fallback_index: &Arc<RwLock<Option<FileIndex>>>,
     query: String,
+    pipe_client: &mut Option<PipeClient>,
 ) -> UiPayload {
     if query.trim().chars().count() < 2 && config.under_dir.is_none() {
         return UiPayload {
@@ -223,7 +273,7 @@ fn run_search(
     };
 
     let (raw_results, took_ms, total_entries, mode_text) =
-        match query_service(&config.pipe_name, &request) {
+        match query_service(&config.pipe_name, &request, pipe_client) {
             Ok(response) => (
                 response.results,
                 response.took_ms,
@@ -308,32 +358,48 @@ fn run_search(
 
 fn trigger_search(
     ui_weak: slint::Weak<MainWindow>,
-    config: Arc<GuiConfig>,
-    fallback_index: Arc<RwLock<Option<FileIndex>>>,
     latest_request: Arc<AtomicU64>,
-    paths: Arc<Mutex<Vec<String>>>,
+    search_tx: mpsc::Sender<SearchCommand>,
 ) {
     let Some(ui) = ui_weak.upgrade() else {
         return;
     };
     let query = ui.get_query().to_string();
     let request_id = latest_request.fetch_add(1, Ordering::SeqCst) + 1;
-    ui.set_status_text("Searching...".into());
+    let _ = search_tx.send(SearchCommand { request_id, query });
+}
 
+fn spawn_search_worker(
+    ui_weak: slint::Weak<MainWindow>,
+    config: Arc<GuiConfig>,
+    fallback_index: Arc<RwLock<Option<FileIndex>>>,
+    latest_request: Arc<AtomicU64>,
+    paths: Arc<Mutex<Vec<String>>>,
+) -> mpsc::Sender<SearchCommand> {
+    let (tx, rx) = mpsc::channel::<SearchCommand>();
     thread::spawn(move || {
-        let payload = run_search(&config, &fallback_index, query);
-        let ui_weak_apply = ui_weak.clone();
-        let latest_apply = latest_request.clone();
-        let paths_apply = paths.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if latest_apply.load(Ordering::SeqCst) != request_id {
-                return;
+        let mut pipe_client = None;
+        while let Ok(mut command) = rx.recv() {
+            while let Ok(next) = rx.try_recv() {
+                command = next;
             }
-            if let Some(ui) = ui_weak_apply.upgrade() {
-                apply_payload(&ui, payload, &paths_apply);
-            }
-        });
+
+            let payload = run_search(&config, &fallback_index, command.query, &mut pipe_client);
+            let request_id = command.request_id;
+            let latest_apply = latest_request.clone();
+            let paths_apply = paths.clone();
+            let ui_weak_apply = ui_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if latest_apply.load(Ordering::SeqCst) != request_id {
+                    return;
+                }
+                if let Some(ui) = ui_weak_apply.upgrade() {
+                    apply_payload(&ui, payload, &paths_apply);
+                }
+            });
+        }
     });
+    tx
 }
 
 fn main() -> Result<()> {
@@ -343,7 +409,7 @@ fn main() -> Result<()> {
         pipe_name: cli.pipe,
         under_dir: cli.under,
         limit: cli.limit.max(1),
-        debounce_ms: cli.debounce_ms.max(15),
+        debounce_ms: cli.debounce_ms,
     });
     let fallback_index: Arc<RwLock<Option<FileIndex>>> = Arc::new(RwLock::new(None));
     let latest_request = Arc::new(AtomicU64::new(0));
@@ -400,31 +466,29 @@ fn main() -> Result<()> {
     }
 
     let debounce_timer = Rc::new(RefCell::new(Timer::default()));
+    let search_tx = spawn_search_worker(
+        ui.as_weak(),
+        config.clone(),
+        fallback_index.clone(),
+        latest_request.clone(),
+        result_paths.clone(),
+    );
 
     {
         let ui_weak = ui.as_weak();
         let timer = debounce_timer.clone();
         let config = config.clone();
-        let fallback_index = fallback_index.clone();
         let latest_request = latest_request.clone();
-        let result_paths = result_paths.clone();
+        let search_tx = search_tx.clone();
         ui.on_query_edited(move |_text| {
             let ui_weak2 = ui_weak.clone();
-            let config2 = config.clone();
-            let fallback2 = fallback_index.clone();
             let latest2 = latest_request.clone();
-            let paths2 = result_paths.clone();
+            let search_tx2 = search_tx.clone();
             timer.borrow_mut().start(
                 TimerMode::SingleShot,
                 Duration::from_millis(config.debounce_ms),
                 move || {
-                    trigger_search(
-                        ui_weak2.clone(),
-                        config2.clone(),
-                        fallback2.clone(),
-                        latest2.clone(),
-                        paths2.clone(),
-                    );
+                    trigger_search(ui_weak2.clone(), latest2.clone(), search_tx2.clone());
                 },
             );
         });
@@ -432,18 +496,10 @@ fn main() -> Result<()> {
 
     {
         let ui_weak = ui.as_weak();
-        let config = config.clone();
-        let fallback_index = fallback_index.clone();
         let latest_request = latest_request.clone();
-        let result_paths = result_paths.clone();
+        let search_tx = search_tx.clone();
         ui.on_search_now(move || {
-            trigger_search(
-                ui_weak.clone(),
-                config.clone(),
-                fallback_index.clone(),
-                latest_request.clone(),
-                result_paths.clone(),
-            );
+            trigger_search(ui_weak.clone(), latest_request.clone(), search_tx.clone());
         });
     }
 
@@ -534,13 +590,7 @@ fn main() -> Result<()> {
         });
     }
 
-    trigger_search(
-        ui.as_weak(),
-        config,
-        fallback_index,
-        latest_request,
-        result_paths,
-    );
+    trigger_search(ui.as_weak(), latest_request, search_tx);
     ui.run()
         .map_err(|err| anyhow!("failed to run GUI event loop: {err}"))?;
     Ok(())
