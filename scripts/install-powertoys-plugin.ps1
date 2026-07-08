@@ -83,7 +83,7 @@ function Download-ReleaseAsset {
     $tmpDir = Join-Path $env:TEMP "rayo-plugin-install"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
     $assetPath = Join-Path $tmpDir $AssetName
-    Write-Host "Downloading $AssetName: $($asset.browser_download_url)"
+    Write-Host "Downloading ${AssetName}: $($asset.browser_download_url)"
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $assetPath -Headers $headers
     return $assetPath
 }
