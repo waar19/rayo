@@ -22,6 +22,8 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 
 - `crates/rayo-core`: indexado, búsqueda, integración NTFS/USN, persistencia.
 - `crates/rayo-cli`: interfaz CLI (`index`, `search`, `watch`).
+- `crates/rayo-service`: servicio de fondo elevado con índice en memoria y API por named pipe.
+- `crates/rayo-gui`: GUI nativa (`egui`) con búsqueda por servicio o fallback local.
 
 ## Requisitos
 
@@ -43,7 +45,22 @@ cargo run -p rayo-cli -- search --index .\c.rayo --query report --ext pdf
 
 # Mantener índice actualizado (terminal como Administrador)
 cargo run -p rayo-cli -- watch --drive C --index .\c.rayo
+
+# Levantar servicio de fondo (terminal como Administrador)
+cargo run -p rayo-service -- --drive C --index .\c.rayo
+
+# Abrir GUI (intenta servicio, si no fallback al índice local)
+cargo run -p rayo-gui -- --index .\c.rayo
+
+# Opcional: instalar menú contextual de Explorer para usuario actual
+cargo run -p rayo-cli -- shell install --gui-path .\target\debug\rayo-gui.exe
 ```
+
+### Atajos de GUI
+
+- `Enter`: abre resultado seleccionado.
+- `Ctrl+Enter`: abre resultado como Administrador (UAC).
+- Menú contextual por fila: abrir, abrir como admin, abrir carpeta contenedora, copiar ruta.
 
 ## Resultados de validación (Windows 11, C:, Jul 2026)
 
@@ -61,6 +78,12 @@ Muestras de latencia de búsqueda sobre índice real:
 - `--query kernel --glob "**/*.dll" --limit 20`: `20` resultados en `2.2629864s` (wall-clock `16657 ms`).
 
 La validación de watch cubrió creación, renombrado y borrado de archivos.
+
+Validación de servicio + integración:
+
+- `rayo-service` inició elevado con índice existente y expuso `\\.\pipe\rayo-query`.
+- Consulta no elevada por named pipe devolvió resultados JSON correctamente.
+- `rayo-cli shell install` y `shell uninstall` crearon y removieron entradas de menú contextual en `HKCU\Software\Classes`.
 
 ## Hoja de ruta
 

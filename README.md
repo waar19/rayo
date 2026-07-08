@@ -22,6 +22,8 @@ English | [Español](README.es.md)
 
 - `crates/rayo-core`: indexing, search, NTFS/USN integration, persistence.
 - `crates/rayo-cli`: CLI interface (`index`, `search`, `watch`).
+- `crates/rayo-service`: elevated background service with live in-memory index and named pipe API.
+- `crates/rayo-gui`: native desktop GUI (`egui`) with service/fallback search modes.
 
 ## Requirements
 
@@ -43,7 +45,22 @@ cargo run -p rayo-cli -- search --index .\c.rayo --query report --ext pdf
 
 # Keep index updated (run terminal as Administrator)
 cargo run -p rayo-cli -- watch --drive C --index .\c.rayo
+
+# Start background service (run terminal as Administrator)
+cargo run -p rayo-service -- --drive C --index .\c.rayo
+
+# Open GUI (tries service first, falls back to local index file)
+cargo run -p rayo-gui -- --index .\c.rayo
+
+# Optional: install Explorer context menu for current user
+cargo run -p rayo-cli -- shell install --gui-path .\target\debug\rayo-gui.exe
 ```
+
+### GUI shortcuts
+
+- `Enter`: open selected result.
+- `Ctrl+Enter`: open selected result as Administrator (UAC prompt).
+- Context menu on each row: open, open as admin, open containing folder, copy path.
 
 ## Validation results (Windows 11, C:, Jul 2026)
 
@@ -61,6 +78,12 @@ Search latency samples on real index:
 - `--query kernel --glob "**/*.dll" --limit 20`: `20` results in `2.2629864s` (wall-clock `16657 ms`).
 
 Watch validation covered file create/rename/delete events.
+
+Service + integration validation:
+
+- `rayo-service` started elevated with existing index and exposed `\\.\pipe\rayo-query`.
+- Non-elevated client query over named pipe returned JSON results successfully.
+- `rayo-cli shell install` and `shell uninstall` wrote and removed Explorer context menu entries in `HKCU\Software\Classes`.
 
 ## Roadmap
 
