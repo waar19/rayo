@@ -721,6 +721,19 @@ fn main() -> Result<()> {
         let ui_weak = ui.as_weak();
         let latest_request = latest_request.clone();
         let search_tx = search_tx.clone();
+        ui.on_clear_query(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_query("".into());
+                ui.set_selected_index(-1);
+            }
+            trigger_search(ui_weak.clone(), latest_request.clone(), search_tx.clone());
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let latest_request = latest_request.clone();
+        let search_tx = search_tx.clone();
         ui.on_search_now(move || {
             trigger_search(ui_weak.clone(), latest_request.clone(), search_tx.clone());
         });
@@ -765,6 +778,19 @@ fn main() -> Result<()> {
                 ui.set_settings_directories_only(defaults.directories_only);
                 ui.set_settings_limit(defaults.limit as i32);
                 ui.set_settings_debounce_ms(defaults.debounce_ms as i32);
+                ui.set_settings_error_text("".into());
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_clear_settings_filters(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_settings_under_dir("".into());
+                ui.set_settings_extension("".into());
+                ui.set_settings_files_only(false);
+                ui.set_settings_directories_only(false);
                 ui.set_settings_error_text("".into());
             }
         });

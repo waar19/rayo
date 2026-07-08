@@ -1,10 +1,14 @@
 /target
 /dist
+.vs/
 *.rayo
 *.rayo.tmp-*
 *.bin
 *.log
 *.err
+*.user
+*.suo
+*.userprefs
 elev-check.txt
 rayo_watch_validation*/
 integrations/powertoys-run/bin/

@@ -30,11 +30,13 @@ export component MainWindow inherits Window {
     forward-focus: keyboard-shortcuts;
 
     callback query-edited(string);
+    callback clear-query();
     callback search-now();
     callback open-settings();
     callback save-settings(string, string, bool, bool, int, int);
     callback cancel-settings();
     callback reset-settings();
+    callback clear-settings-filters();
     callback select-row(int);
     callback activate-row(int);
     callback open-selected();
@@ -70,9 +72,16 @@ export component MainWindow inherits Window {
                     placeholder-text: "Search files and folders";
                     font-size: 15px;
                     height: 36px;
-                    edited => {
+                    changed text => {
                         root.query-edited(self.text);
                     }
+                }
+
+                Button {
+                    text: "X";
+                    enabled: root.query != "";
+                    horizontal-stretch: 0;
+                    clicked => { root.clear-query(); }
                 }
 
                 Button {
@@ -215,6 +224,12 @@ export component MainWindow inherits Window {
                                 placeholder-text: "Example: pdf";
                             }
 
+                            Text {
+                                text: "Tip: Save applies filters immediately to the current search.";
+                                color: #8fa4bf;
+                                font-size: 12px;
+                            }
+
                             if root.settings-error-text != "" : Text {
                                 text: root.settings-error-text;
                                 color: #ff6b6b;
@@ -275,6 +290,11 @@ export component MainWindow inherits Window {
                             HorizontalBox {
                                 spacing: 8px;
                                 Rectangle { horizontal-stretch: 1; }
+                                Button {
+                                    text: "Clear filters";
+                                    horizontal-stretch: 0;
+                                    clicked => { root.clear-settings-filters(); }
+                                }
                                 Button {
                                     text: "Reset";
                                     horizontal-stretch: 0;
