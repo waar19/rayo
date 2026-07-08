@@ -190,7 +190,7 @@ fn build_glob(pattern: &str) -> Result<GlobMatcher> {
     let glob = GlobBuilder::new(pattern)
         .case_insensitive(true)
         .build()
-        .with_context(|| format!("glob invalido: {pattern}"))?;
+        .with_context(|| format!("invalid glob: {pattern}"))?;
     Ok(glob.compile_matcher())
 }
 

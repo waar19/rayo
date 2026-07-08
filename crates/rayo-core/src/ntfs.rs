@@ -25,7 +25,7 @@ use crate::index::{FileEntry, JournalBatch, JournalChange, MftSnapshot};
 pub fn normalize_drive(raw: &str) -> Result<String> {
     let drive = raw.trim().trim_end_matches('\\').trim_end_matches(':');
     if drive.len() != 1 || !drive.chars().all(|c| c.is_ascii_alphabetic()) {
-        return Err(anyhow!("unidad invalida: {raw}. Usa por ejemplo C o C:"));
+        return Err(anyhow!("invalid drive: {raw}. Use for example C or C:"));
     }
     Ok(format!("{}:", drive.to_ascii_uppercase()))
 }
@@ -66,7 +66,7 @@ pub fn enumerate_mft(drive: &str) -> Result<MftSnapshot> {
             if err.code() == HRESULT::from_win32(ERROR_HANDLE_EOF.0) {
                 break;
             }
-            return Err(anyhow!("FSCTL_ENUM_USN_DATA fallo: {err}"));
+            return Err(anyhow!("FSCTL_ENUM_USN_DATA failed: {err}"));
         }
 
         if bytes_returned <= 8 {
@@ -74,7 +74,7 @@ pub fn enumerate_mft(drive: &str) -> Result<MftSnapshot> {
         }
 
         enum_data.StartFileReferenceNumber =
-            u64::from_ne_bytes(buffer[0..8].try_into().expect("buffer header invalido"));
+            u64::from_ne_bytes(buffer[0..8].try_into().expect("invalid buffer header"));
 
         let mut offset = 8usize;
         while offset + size_of::<USN_RECORD_V2>() <= bytes_returned as usize {
@@ -113,7 +113,7 @@ pub fn collect_changes(drive: &str, journal_id: u64, start_usn: i64) -> Result<J
 
     if current.UsnJournalID != journal_id {
         return Err(anyhow!(
-            "el journal cambio (id previo {journal_id}, actual {})",
+            "journal changed (previous id {journal_id}, current {})",
             current.UsnJournalID
         ));
     }
@@ -145,16 +145,16 @@ pub fn collect_changes(drive: &str, journal_id: u64, start_usn: i64) -> Result<J
         if code == HRESULT::from_win32(ERROR_JOURNAL_NOT_ACTIVE.0)
             || code == HRESULT::from_win32(ERROR_JOURNAL_DELETE_IN_PROGRESS.0)
         {
-            return Err(anyhow!("USN Journal no activo en el volumen: {err}"));
+            return Err(anyhow!("USN Journal not active on volume: {err}"));
         }
-        return Err(anyhow!("FSCTL_READ_USN_JOURNAL fallo: {err}"));
+        return Err(anyhow!("FSCTL_READ_USN_JOURNAL failed: {err}"));
     }
 
     let mut events = Vec::new();
     let mut next_usn = start_usn;
 
     if bytes_returned >= 8 {
-        next_usn = i64::from_ne_bytes(buffer[0..8].try_into().expect("header USN invalido"));
+        next_usn = i64::from_ne_bytes(buffer[0..8].try_into().expect("invalid USN header"));
         let mut offset = 8usize;
         while offset + size_of::<USN_RECORD_V2>() <= bytes_returned as usize {
             let record = unsafe { &*(buffer.as_ptr().add(offset).cast::<USN_RECORD_V2>()) };
@@ -202,7 +202,7 @@ fn query_journal_data(volume: HANDLE) -> Result<USN_JOURNAL_DATA_V0> {
         )
     };
     if let Err(err) = ok {
-        return Err(anyhow!("FSCTL_QUERY_USN_JOURNAL fallo: {err}"));
+        return Err(anyhow!("FSCTL_QUERY_USN_JOURNAL failed: {err}"));
     }
     Ok(journal)
 }
@@ -212,7 +212,7 @@ fn decode_usn_name(base_ptr: *const u8, offset: usize, record: &USN_RECORD_V2) -
     let name_offset = offset + record.FileNameOffset as usize;
     let name_ptr = unsafe { base_ptr.add(name_offset).cast::<u16>() };
     let name_slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
-    String::from_utf16(name_slice).context("nombre UTF-16 invalido en USN_RECORD")
+    String::from_utf16(name_slice).context("invalid UTF-16 name in USN_RECORD")
 }
 
 fn open_volume(drive: &str) -> Result<HANDLE> {
@@ -229,10 +229,10 @@ fn open_volume(drive: &str) -> Result<HANDLE> {
             None,
         )
     }
-    .with_context(|| format!("no se pudo abrir volumen {volume_path}"))?;
+    .with_context(|| format!("failed to open volume {volume_path}"))?;
 
     if handle == INVALID_HANDLE_VALUE {
-        return Err(anyhow!("handle invalido al abrir {volume_path}"));
+        return Err(anyhow!("invalid handle while opening {volume_path}"));
     }
     Ok(handle)
 }

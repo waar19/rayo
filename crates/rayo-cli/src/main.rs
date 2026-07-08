@@ -10,7 +10,7 @@ use rayo_core::{
 };
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Buscador NTFS ultrarrapido para Windows")]
+#[command(author, version, about = "Ultra-fast NTFS file search for Windows")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -18,14 +18,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Construye o reconstruye el indice desde MFT/USN
+    /// Build or rebuild index from MFT/USN
     Index {
         #[arg(long, default_value = "C")]
         drive: String,
         #[arg(long, default_value = "index.rayo")]
         output: PathBuf,
     },
-    /// Busca en un indice existente
+    /// Search inside an existing index
     Search {
         #[arg(long)]
         index: PathBuf,
@@ -44,7 +44,7 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
-    /// Mantiene el indice actualizado con el USN Journal
+    /// Keep index up to date from USN Journal
     Watch {
         #[arg(long, default_value = "C")]
         drive: String,
@@ -82,20 +82,20 @@ fn run_index(drive: &str, output: PathBuf) -> Result<()> {
     let drive = normalize_drive(drive)?;
     let started = Instant::now();
     println!(
-        "Iniciando indexado en {}. Esto puede tardar varios minutos...",
+        "Starting index build on {}. This can take several minutes...",
         drive
     );
     let build_started = Instant::now();
     let index = FileIndex::build(&drive)?;
     println!(
-        "Lectura de MFT/Journaling completada en {:?}. Guardando indice...",
+        "MFT/journal scan completed in {:?}. Saving index...",
         build_started.elapsed()
     );
     let save_started = Instant::now();
     save_index(&index, &output)?;
-    println!("Indice persistido en {:?}", save_started.elapsed());
+    println!("Index persisted in {:?}", save_started.elapsed());
     println!(
-        "Indice generado: {} entradas en {:?} -> {}",
+        "Index generated: {} entries in {:?} -> {}",
         index.entries.len(),
         started.elapsed(),
         output.display()
@@ -130,7 +130,7 @@ fn run_search(
         let entry_type = if result.is_directory { "DIR " } else { "FILE" };
         println!("[{entry_type}] {}", result.path);
     }
-    println!("Resultados: {} en {:?}", results.len(), started.elapsed());
+    println!("Results: {} in {:?}", results.len(), started.elapsed());
     Ok(())
 }
 
@@ -138,33 +138,33 @@ fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
     require_admin()?;
     let drive = normalize_drive(drive)?;
     println!(
-        "Preparando watch en {}. Bootstrap inicial puede tardar...",
+        "Preparing watch on {}. Initial bootstrap can take time...",
         drive
     );
     let mut index = if index_path.exists() {
-        println!("Cargando indice existente: {}", index_path.display());
+        println!("Loading existing index: {}", index_path.display());
         let loaded = load_index(&index_path)?;
         if loaded.drive.eq_ignore_ascii_case(&drive) {
-            println!("Indice existente compatible ({})", loaded.drive);
+            println!("Existing index is compatible ({})", loaded.drive);
             loaded
         } else {
             println!(
-                "Indice actual pertenece a {}. Reconstruyendo para {}...",
+                "Existing index belongs to {}. Rebuilding for {}...",
                 loaded.drive, drive
             );
             FileIndex::build(&drive)?
         }
     } else {
         println!(
-            "No existe indice en {}. Construyendo indice inicial...",
+            "No index found at {}. Building initial index...",
             index_path.display()
         );
         FileIndex::build(&drive)?
     };
-    println!("Guardando snapshot inicial de watch...");
+    println!("Saving initial watch snapshot...");
     save_index(&index, &index_path)?;
     println!(
-        "Watch iniciado en {} ({} entradas). Ctrl+C para salir.",
+        "Watch started on {} ({} entries). Press Ctrl+C to exit.",
         drive,
         index.entries.len()
     );
@@ -181,21 +181,21 @@ fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
         if changed > 0 {
             save_index(&index, &index_path)?;
             println!(
-                "Actualizado: {changed} cambios aplicados. Total: {}",
+                "Updated: {changed} changes applied. Total: {}",
                 index.entries.len()
             );
         }
         std::thread::sleep(sleep);
     }
 
-    println!("Watch finalizado.");
+    println!("Watch stopped.");
     Ok(())
 }
 
 fn require_admin() -> Result<()> {
     if !is_running_as_admin() {
         return Err(anyhow!(
-            "este comando requiere permisos de Administrador para leer MFT/USN Journal"
+            "this command requires Administrator privileges to read MFT/USN Journal"
         ));
     }
     Ok(())

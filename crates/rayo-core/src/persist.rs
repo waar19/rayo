@@ -11,33 +11,33 @@ pub fn save_index(index: &FileIndex, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("no se pudo crear carpeta {}", parent.display()))?;
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
     let temp_path = build_temp_index_path(path);
     let file = File::create(&temp_path)
-        .with_context(|| format!("no se pudo crear temporal {}", temp_path.display()))?;
+        .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
     let mut writer = BufWriter::new(file);
     bincode::serialize_into(&mut writer, index)
-        .with_context(|| format!("no se pudo serializar indice a {}", temp_path.display()))?;
+        .with_context(|| format!("failed to serialize index into {}", temp_path.display()))?;
     writer
         .flush()
-        .with_context(|| format!("no se pudo vaciar buffer {}", temp_path.display()))?;
+        .with_context(|| format!("failed to flush buffer {}", temp_path.display()))?;
     let file = writer
         .into_inner()
         .map_err(|err| err.into_error())
-        .with_context(|| format!("no se pudo finalizar escritura {}", temp_path.display()))?;
+        .with_context(|| format!("failed to finalize write {}", temp_path.display()))?;
     file.sync_all()
-        .with_context(|| format!("no se pudo sincronizar {}", temp_path.display()))?;
+        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
 
     if path.exists() {
         std::fs::remove_file(path)
-            .with_context(|| format!("no se pudo reemplazar {}", path.display()))?;
+            .with_context(|| format!("failed to replace {}", path.display()))?;
     }
     if let Err(err) = std::fs::rename(&temp_path, path) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(err).with_context(|| {
             format!(
-                "no se pudo mover temporal {} a {}",
+                "failed to move temp file {} to {}",
                 temp_path.display(),
                 path.display()
             )
@@ -48,10 +48,10 @@ pub fn save_index(index: &FileIndex, path: impl AsRef<Path>) -> Result<()> {
 
 pub fn load_index(path: impl AsRef<Path>) -> Result<FileIndex> {
     let path = path.as_ref();
-    let file = File::open(path).with_context(|| format!("no se pudo abrir {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
     let index: FileIndex = bincode::deserialize_from(reader)
-        .with_context(|| format!("no se pudo deserializar indice en {}", path.display()))?;
+        .with_context(|| format!("failed to deserialize index at {}", path.display()))?;
     Ok(index)
 }
 

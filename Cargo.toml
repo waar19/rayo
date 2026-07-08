@@ -5,6 +5,8 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
+description = "Ultra-fast NTFS file search engine for Windows, inspired by Everything."
+repository = "https://github.com/waar19/rayo"
 
 [workspace.dependencies]
 anyhow = "1.0"
