@@ -34,6 +34,20 @@ jobs:
       - name: Publish PowerToys plugin
         run: dotnet publish .\integrations\powertoys-run\Community.PowerToys.Run.Plugin.Rayo.csproj -c Release -o .\dist\powertoys-run\RayoPlugin
 
+      - name: Remove PowerToys host DLLs from plugin output
+        shell: pwsh
+        run: |
+          $forbidden = @(
+            "Wox.Plugin.dll",
+            "Wox.Infrastructure.dll",
+            "PowerToys.Common.UI.dll",
+            "PowerToys.ManagedCommon.dll",
+            "PowerToys.Settings.UI.Lib.dll"
+          )
+          Get-ChildItem .\dist\powertoys-run\RayoPlugin -Recurse -File |
+            Where-Object { $forbidden -contains $_.Name } |
+            Remove-Item -Force
+
       - name: Package PowerToys plugin zip
         shell: pwsh
         run: |

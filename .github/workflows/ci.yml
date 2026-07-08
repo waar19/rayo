@@ -50,11 +50,52 @@ jobs:
       - name: Publish PowerToys plugin
         run: dotnet publish .\integrations\powertoys-run\Community.PowerToys.Run.Plugin.Rayo.csproj -c Release -o .\dist\powertoys-run\RayoPlugin
 
+      - name: Remove PowerToys host DLLs from plugin output
+        shell: pwsh
+        run: |
+          $forbidden = @(
+            "Wox.Plugin.dll",
+            "Wox.Infrastructure.dll",
+            "PowerToys.Common.UI.dll",
+            "PowerToys.ManagedCommon.dll",
+            "PowerToys.Settings.UI.Lib.dll"
+          )
+          Get-ChildItem .\dist\powertoys-run\RayoPlugin -Recurse -File |
+            Where-Object { $forbidden -contains $_.Name } |
+            Remove-Item -Force
+
       - name: Package PowerToys plugin zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path .\dist\powertoys-run -Force | Out-Null
           Compress-Archive -Path .\dist\powertoys-run\RayoPlugin\* -DestinationPath .\dist\powertoys-run\RayoPlugin.zip -Force
+
+      - name: Verify plugin zip does not bundle host DLLs
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = ".\dist\powertoys-run\RayoPlugin.zip"
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $forbidden = @(
+              "Wox.Plugin.dll",
+              "Wox.Infrastructure.dll",
+              "PowerToys.Common.UI.dll",
+              "PowerToys.ManagedCommon.dll",
+              "PowerToys.Settings.UI.Lib.dll"
+            )
+            $badEntries = $archive.Entries | Where-Object {
+              $name = [System.IO.Path]::GetFileName($_.FullName)
+              $forbidden -contains $name
+            }
+            if ($badEntries.Count -gt 0) {
+              Write-Host "Forbidden host DLLs detected in plugin zip:"
+              $badEntries | ForEach-Object { Write-Host $_.FullName }
+              throw "Plugin zip contains host DLLs. Packaging must not include PowerToys/Wox runtime assemblies."
+            }
+          } finally {
+            $archive.Dispose()
+          }
 
       - name: Upload PowerToys plugin artifact
         uses: actions/upload-artifact@v4
