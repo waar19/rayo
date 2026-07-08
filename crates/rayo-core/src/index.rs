@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
-use rayon::iter::{ParallelBridge, ParallelIterator};
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
 use crate::ntfs::{collect_changes, enumerate_mft, normalize_drive};
@@ -111,6 +111,7 @@ impl FileIndex {
 
     pub fn search(&self, options: &SearchOptions) -> Vec<SearchResult> {
         let normalized_query = options.query.to_ascii_lowercase();
+        let limit = options.limit.max(1);
         let ext = options
             .extension
             .as_ref()
@@ -126,11 +127,9 @@ impl FileIndex {
 
         let mut results: Vec<SearchResult> = self
             .entries
-            .values()
-            .par_bridge()
-            .filter_map(|entry| {
-                let name_lower = entry.name.to_ascii_lowercase();
-                if !name_lower.contains(&normalized_query) {
+            .par_iter()
+            .filter_map(|(_, entry)| {
+                if !contains_ignore_ascii_case(&entry.name, &normalized_query) {
                     return None;
                 }
                 if options.directories_only && !entry.is_directory() {
@@ -172,11 +171,13 @@ impl FileIndex {
                     is_directory: entry.is_directory(),
                 })
             })
+            // Early-stop once we have enough matches to keep latency low while typing.
+            .take_any(limit)
             .collect();
 
         results.sort_by(|a, b| a.path.cmp(&b.path));
-        if results.len() > options.limit {
-            results.truncate(options.limit);
+        if results.len() > limit {
+            results.truncate(limit);
         }
         results
     }
@@ -192,6 +193,22 @@ fn build_glob(pattern: &str) -> Result<GlobMatcher> {
         .build()
         .with_context(|| format!("invalid glob: {pattern}"))?;
     Ok(glob.compile_matcher())
+}
+
+fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+
+    let haystack = haystack.as_bytes();
+    let needle = needle_lower.as_bytes();
+    if needle.len() > haystack.len() {
+        return false;
+    }
+
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +283,15 @@ pub struct MftSnapshot {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{FileEntry, FileIndex, SearchOptions};
+    use super::{FileEntry, FileIndex, SearchOptions, contains_ignore_ascii_case};
+
+    #[test]
+    fn contains_ignore_ascii_case_handles_ascii_cases() {
+        assert!(contains_ignore_ascii_case("ReportClient.exe", "report"));
+        assert!(contains_ignore_ascii_case("anything", ""));
+        assert!(!contains_ignore_ascii_case("abc", "abcdef"));
+        assert!(!contains_ignore_ascii_case("kernel32.dll", "report"));
+    }
 
     #[test]
     fn resolve_and_filter_search() {
