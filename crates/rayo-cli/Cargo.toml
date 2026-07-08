@@ -11,3 +11,4 @@ anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 rayo-core = { path = "../rayo-core" }
+winreg.workspace = true

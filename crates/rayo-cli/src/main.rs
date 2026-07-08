@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -8,6 +8,8 @@ use clap::{Parser, Subcommand};
 use rayo_core::{
     FileIndex, SearchOptions, is_running_as_admin, load_index, normalize_drive, save_index,
 };
+use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Ultra-fast NTFS file search for Windows")]
@@ -53,6 +55,20 @@ enum Commands {
         #[arg(long, default_value_t = 500)]
         poll_ms: u64,
     },
+    /// Install or remove Explorer integration in current user registry
+    Shell {
+        #[command(subcommand)]
+        action: ShellAction,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ShellAction {
+    Install {
+        #[arg(long)]
+        gui_path: Option<PathBuf>,
+    },
+    Uninstall,
 }
 
 fn main() -> Result<()> {
@@ -74,6 +90,7 @@ fn main() -> Result<()> {
             index,
             poll_ms,
         } => run_watch(&drive, index, poll_ms),
+        Commands::Shell { action } => run_shell(action),
     }
 }
 
@@ -199,4 +216,79 @@ fn require_admin() -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn run_shell(action: ShellAction) -> Result<()> {
+    match action {
+        ShellAction::Install { gui_path } => install_shell_integration(gui_path),
+        ShellAction::Uninstall => uninstall_shell_integration(),
+    }
+}
+
+fn install_shell_integration(gui_path: Option<PathBuf>) -> Result<()> {
+    let gui_exe = resolve_gui_path(gui_path)?;
+    let gui_command = format!("\"{}\" --under", gui_exe.display());
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+    let dir_shell =
+        r"Software\Classes\Directory\shell\RayoSearch";
+    let (dir_key, _) = hkcu.create_subkey(dir_shell)?;
+    dir_key.set_value("", &"Search with Rayo here")?;
+    let (dir_command_key, _) = dir_key.create_subkey("command")?;
+    dir_command_key.set_value("", &format!("{gui_command} \"%1\""))?;
+
+    let bg_shell =
+        r"Software\Classes\Directory\Background\shell\RayoSearch";
+    let (bg_key, _) = hkcu.create_subkey(bg_shell)?;
+    bg_key.set_value("", &"Search with Rayo here")?;
+    let (bg_command_key, _) = bg_key.create_subkey("command")?;
+    bg_command_key.set_value("", &format!("{gui_command} \"%V\""))?;
+
+    println!("Explorer context menu installed for current user.");
+    println!("Windows 11 note: entry appears under 'Show more options'.");
+    Ok(())
+}
+
+fn uninstall_shell_integration() -> Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let dir_shell =
+        r"Software\Classes\Directory\shell\RayoSearch";
+    let bg_shell =
+        r"Software\Classes\Directory\Background\shell\RayoSearch";
+
+    let _ = hkcu.delete_subkey_all(dir_shell);
+    let _ = hkcu.delete_subkey_all(bg_shell);
+
+    println!("Explorer context menu removed for current user.");
+    Ok(())
+}
+
+fn resolve_gui_path(gui_path: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = gui_path {
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(anyhow!("GUI executable not found at {}", path.display()));
+    }
+
+    let current_exe = std::env::current_exe()?;
+    let base_dir = current_exe
+        .parent()
+        .ok_or_else(|| anyhow!("failed to resolve current executable directory"))?;
+
+    let candidates = [
+        base_dir.join("rayo-gui.exe"),
+        Path::new("target").join("release").join("rayo-gui.exe"),
+        Path::new("target").join("debug").join("rayo-gui.exe"),
+    ];
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "rayo-gui.exe not found. Build it or pass --gui-path."
+    ))
 }
