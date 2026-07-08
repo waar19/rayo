@@ -1,0 +1,13 @@
+[package]
+name = "rayo-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow.workspace = true
+bincode.workspace = true
+globset.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+windows.workspace = true
