@@ -185,8 +185,6 @@ pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\
 
 Qué hace:
 - Detecta PowerToys.
-- Detecta `.NET Desktop Runtime 8`.
-- Opcionalmente instala faltantes con `winget`.
 - Instala plugin en `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
 
 ### Assets de release
@@ -200,7 +198,7 @@ Qué hace:
 
 Si PowerToys muestra error al iniciar plugin Rayo:
 
-1. Verifica que usas último release (`v0.1.2` o superior).
+1. Verifica que usas último release (`v0.1.3` o superior).
 2. Reinstala plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex
@@ -209,6 +207,8 @@ Si PowerToys muestra error al iniciar plugin Rayo:
    `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Logs\<version>\<fecha>.txt`
 4. Busca:
    `Can't find class implement IPlugin` o errores de carga `System.Runtime`.
+
+5. Si logs muestran mismatch de `IPlugin`, tu paquete incluyó DLLs del host (`Wox.Plugin.dll` / `PowerToys.*.dll`). Reinstala desde último release.
 
 ## Licencia
 

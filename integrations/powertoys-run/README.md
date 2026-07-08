@@ -38,4 +38,4 @@ Troubleshooting:
 - If PowerToys says plugin failed to initialize, reinstall from latest release first.
 - Check PowerToys Run logs in:
   `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Logs\`
-- Common root cause fixed in current versions: plugin/runtime mismatch.
+- If logs show `Can't find class implement IPlugin`, plugin package likely bundled host DLLs (Wox/PowerToys). Install latest release zip.

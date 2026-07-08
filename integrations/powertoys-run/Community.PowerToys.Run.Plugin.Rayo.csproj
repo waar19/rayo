@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetFramework>net9.0-windows10.0.26100.0</TargetFramework>
     <UseWPF>true</UseWPF>
     <Platforms>x64;ARM64</Platforms>
     <PlatformTarget>$(Platform)</PlatformTarget>
@@ -11,7 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Community.PowerToys.Run.Plugin.Dependencies" Version="0.97.0" />
+    <PackageReference Include="Community.PowerToys.Run.Plugin.Dependencies" Version="0.97.0" ExcludeAssets="runtime" />
   </ItemGroup>
 
   <ItemGroup>

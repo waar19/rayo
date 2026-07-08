@@ -35,14 +35,6 @@ function Get-PowerToysExePath {
     return $null
 }
 
-function Test-DotNetDesktopRuntime {
-    if (-not (Test-Command "dotnet")) {
-        return $false
-    }
-    $runtimeLines = dotnet --list-runtimes
-    return ($runtimeLines | Select-String "Microsoft.WindowsDesktop.App 8\.") -ne $null
-}
-
 function Stop-PowerToysIfRunning {
     param([bool]$ShouldStop)
     if (-not $ShouldStop) {
@@ -102,7 +94,6 @@ if (-not (Test-Path $PluginZipPath)) {
 $pluginRoot = Join-Path $env:LOCALAPPDATA "Microsoft/PowerToys/PowerToys Run/Plugins/Rayo"
 $powerToysExe = Get-PowerToysExePath
 $hasPowerToys = $null -ne $powerToysExe
-$hasDesktopRuntime = Test-DotNetDesktopRuntime
 
 if (-not $hasPowerToys) {
     Write-Warning "PowerToys not detected."
@@ -117,24 +108,8 @@ if (-not $hasPowerToys) {
     }
 }
 
-if (-not $hasDesktopRuntime) {
-    Write-Warning ".NET Desktop Runtime 8 not detected."
-    if ($AutoInstallDependencies) {
-        if (-not (Test-Command "winget")) {
-            throw "winget not found. Install .NET Desktop Runtime manually: https://dotnet.microsoft.com/download/dotnet/8.0"
-        }
-        Write-Host "Installing .NET Desktop Runtime 8..."
-        Install-WithWinget -Id "Microsoft.DotNet.DesktopRuntime.8"
-        $hasDesktopRuntime = Test-DotNetDesktopRuntime
-    }
-}
-
 if (-not $hasPowerToys) {
     throw "PowerToys still not detected. Install it, then rerun installer."
-}
-
-if (-not $hasDesktopRuntime) {
-    throw ".NET Desktop Runtime 8 still not detected. Install it, then rerun installer."
 }
 
 $powerToysWasRunning = Stop-PowerToysIfRunning -ShouldStop $RestartPowerToys

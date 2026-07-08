@@ -25,7 +25,7 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "9.0.x"
 
       - name: Build Windows bundle
         shell: pwsh
@@ -39,6 +39,33 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path .\dist\powertoys-run -Force | Out-Null
           Compress-Archive -Path .\dist\powertoys-run\RayoPlugin\* -DestinationPath .\dist\powertoys-run\RayoPlugin.zip -Force
+
+      - name: Verify plugin zip does not bundle host DLLs
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = ".\dist\powertoys-run\RayoPlugin.zip"
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $forbidden = @(
+              "Wox.Plugin.dll",
+              "Wox.Infrastructure.dll",
+              "PowerToys.Common.UI.dll",
+              "PowerToys.ManagedCommon.dll",
+              "PowerToys.Settings.UI.Lib.dll"
+            )
+            $badEntries = $archive.Entries | Where-Object {
+              $name = [System.IO.Path]::GetFileName($_.FullName)
+              $forbidden -contains $name
+            }
+            if ($badEntries.Count -gt 0) {
+              Write-Host "Forbidden host DLLs detected in release zip:"
+              $badEntries | ForEach-Object { Write-Host $_.FullName }
+              throw "Plugin zip contains host DLLs. Packaging must not include PowerToys/Wox runtime assemblies."
+            }
+          } finally {
+            $archive.Dispose()
+          }
 
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
