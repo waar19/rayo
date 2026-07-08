@@ -169,6 +169,20 @@ Then restart PowerToys and search with:
 
 `ry <query>`
 
+### Dependency-aware installer
+
+If dependency detection/installation should be automatic:
+
+```powershell
+pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\RayoPlugin.zip -AutoInstallDependencies -RestartPowerToys
+```
+
+What it does:
+- Detects PowerToys.
+- Detects `.NET Desktop Runtime 9`.
+- Optionally installs missing dependencies via `winget`.
+- Installs plugin to `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
+
 ### CI artifact
 
 - CI publishes `rayo-powertoys-plugin` artifact as `RayoPlugin.zip` for install/distribution.

@@ -169,6 +169,20 @@ Luego reinicia PowerToys y busca con:
 
 `ry <consulta>`
 
+### Instalador con detección de dependencias
+
+Si quieres detección/instalación automática:
+
+```powershell
+pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\RayoPlugin.zip -AutoInstallDependencies -RestartPowerToys
+```
+
+Qué hace:
+- Detecta PowerToys.
+- Detecta `.NET Desktop Runtime 9`.
+- Opcionalmente instala faltantes con `winget`.
+- Instala plugin en `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
+
 ### Artifact en CI
 
 - CI publica artifact `rayo-powertoys-plugin` como `RayoPlugin.zip` para instalación/distribución.

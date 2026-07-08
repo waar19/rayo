@@ -21,3 +21,9 @@ Manual installation (PowerToys Run):
    `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`
 3. Restart PowerToys.
 4. Use action keyword `ry` in PowerToys Run.
+
+Automatic installer with dependency detection:
+
+```powershell
+pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\RayoPlugin.zip -AutoInstallDependencies -RestartPowerToys
+```
