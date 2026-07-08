@@ -33,3 +33,9 @@ Local install with explicit zip:
 ```powershell
 pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\RayoPlugin.zip -AutoInstallDependencies -RestartPowerToys
 ```
+
+Troubleshooting:
+- If PowerToys says plugin failed to initialize, reinstall from latest release first.
+- Check PowerToys Run logs in:
+  `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Logs\`
+- Common root cause fixed in current versions: plugin/runtime mismatch.

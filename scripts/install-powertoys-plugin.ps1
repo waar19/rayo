@@ -40,7 +40,7 @@ function Test-DotNetDesktopRuntime {
         return $false
     }
     $runtimeLines = dotnet --list-runtimes
-    return ($runtimeLines | Select-String "Microsoft.WindowsDesktop.App 9\.") -ne $null
+    return ($runtimeLines | Select-String "Microsoft.WindowsDesktop.App 8\.") -ne $null
 }
 
 function Stop-PowerToysIfRunning {
@@ -118,13 +118,13 @@ if (-not $hasPowerToys) {
 }
 
 if (-not $hasDesktopRuntime) {
-    Write-Warning ".NET Desktop Runtime 9 not detected."
+    Write-Warning ".NET Desktop Runtime 8 not detected."
     if ($AutoInstallDependencies) {
         if (-not (Test-Command "winget")) {
-            throw "winget not found. Install .NET Desktop Runtime manually: https://dotnet.microsoft.com/download/dotnet/9.0"
+            throw "winget not found. Install .NET Desktop Runtime manually: https://dotnet.microsoft.com/download/dotnet/8.0"
         }
-        Write-Host "Installing .NET Desktop Runtime 9..."
-        Install-WithWinget -Id "Microsoft.DotNet.DesktopRuntime.9"
+        Write-Host "Installing .NET Desktop Runtime 8..."
+        Install-WithWinget -Id "Microsoft.DotNet.DesktopRuntime.8"
         $hasDesktopRuntime = Test-DotNetDesktopRuntime
     }
 }
@@ -134,7 +134,7 @@ if (-not $hasPowerToys) {
 }
 
 if (-not $hasDesktopRuntime) {
-    throw ".NET Desktop Runtime 9 still not detected. Install it, then rerun installer."
+    throw ".NET Desktop Runtime 8 still not detected. Install it, then rerun installer."
 }
 
 $powerToysWasRunning = Stop-PowerToysIfRunning -ShouldStop $RestartPowerToys

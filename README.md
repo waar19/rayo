@@ -185,7 +185,7 @@ pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\
 
 What it does:
 - Detects PowerToys.
-- Detects `.NET Desktop Runtime 9`.
+- Detects `.NET Desktop Runtime 8`.
 - Optionally installs missing dependencies via `winget`.
 - Installs plugin to `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
 
@@ -195,6 +195,20 @@ What it does:
   - `rayo-windows.zip`
   - `RayoPlugin.zip`
 - Installer downloads `RayoPlugin.zip` from latest release automatically when `-PluginZipPath` is omitted.
+
+### Troubleshooting PowerToys plugin init errors
+
+If PowerToys shows plugin initialization errors for Rayo:
+
+1. Make sure you are on the latest release (`v0.1.2` or newer).
+2. Reinstall plugin:
+   ```powershell
+   irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex
+   ```
+3. If it still fails, check logs:
+   `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Logs\<version>\<date>.txt`
+4. Search for:
+   `Can't find class implement IPlugin` or `System.Runtime` load errors.
 
 ## License
 
