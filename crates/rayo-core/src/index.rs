@@ -14,12 +14,20 @@ pub struct FileEntry {
     pub frn: u64,
     pub parent_frn: u64,
     pub name: String,
+    // Cached lowercase name for fast case-insensitive matching in full scans.
+    // Skipped from persistence to keep index files backwards-compatible.
+    #[serde(skip)]
+    pub name_lower: String,
     pub attributes: u32,
 }
 
 impl FileEntry {
     pub fn is_directory(&self) -> bool {
         (self.attributes & 0x10) != 0
+    }
+
+    pub fn rebuild_lowercase_cache(&mut self) {
+        self.name_lower = self.name.to_ascii_lowercase();
     }
 }
 
@@ -39,7 +47,7 @@ impl FileIndex {
     pub fn build(drive: &str) -> Result<Self> {
         let drive = normalize_drive(drive)?;
         let snapshot = enumerate_mft(&drive)?;
-        Ok(Self {
+        let mut index = Self {
             drive,
             entries: snapshot.entries,
             journal_id: snapshot.journal_id,
@@ -48,7 +56,9 @@ impl FileIndex {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-        })
+        };
+        index.rebuild_lowercase_cache();
+        Ok(index)
     }
 
     pub fn apply_journal_changes(&mut self) -> Result<usize> {
@@ -56,7 +66,9 @@ impl FileIndex {
         for change in &changes.events {
             match change {
                 JournalChange::Upsert(entry) => {
-                    self.entries.insert(entry.frn, entry.clone());
+                    let mut cached = entry.clone();
+                    cached.rebuild_lowercase_cache();
+                    self.entries.insert(cached.frn, cached);
                 }
                 JournalChange::Delete(frn) => {
                     self.entries.remove(frn);
@@ -66,6 +78,12 @@ impl FileIndex {
         self.next_usn = changes.next_usn;
         self.journal_id = changes.journal_id;
         Ok(changes.events.len())
+    }
+
+    pub fn rebuild_lowercase_cache(&mut self) {
+        for entry in self.entries.values_mut() {
+            entry.rebuild_lowercase_cache();
+        }
     }
 
     pub fn resolve_path(&self, frn: u64) -> Option<String> {
@@ -129,7 +147,12 @@ impl FileIndex {
             .entries
             .par_iter()
             .filter_map(|(_, entry)| {
-                if !contains_ignore_ascii_case(&entry.name, &normalized_query) {
+                let matches_query = if entry.name_lower.is_empty() {
+                    contains_ignore_ascii_case(&entry.name, &normalized_query)
+                } else {
+                    entry.name_lower.contains(&normalized_query)
+                };
+                if !matches_query {
                     return None;
                 }
                 if options.directories_only && !entry.is_directory() {
@@ -175,7 +198,8 @@ impl FileIndex {
             .take_any(limit)
             .collect();
 
-        results.sort_by(|a, b| a.path.cmp(&b.path));
+        // Sort only the small candidate set by perceived relevance.
+        results.sort_by(|a, b| compare_relevance(a, b, &normalized_query));
         if results.len() > limit {
             results.truncate(limit);
         }
@@ -209,6 +233,28 @@ fn contains_ignore_ascii_case(haystack: &str, needle_lower: &str) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn compare_relevance(a: &SearchResult, b: &SearchResult, query_lower: &str) -> std::cmp::Ordering {
+    relevance_key(a, query_lower)
+        .cmp(&relevance_key(b, query_lower))
+        .then_with(|| a.path.cmp(&b.path))
+}
+
+fn relevance_key(result: &SearchResult, query_lower: &str) -> (u8, usize, usize) {
+    let file_name = result
+        .path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(result.path.as_str())
+        .to_ascii_lowercase();
+    let starts_with = if file_name.starts_with(query_lower) {
+        0
+    } else {
+        1
+    };
+    let match_pos = file_name.find(query_lower).unwrap_or(usize::MAX);
+    (starts_with, match_pos, result.path.len())
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +348,7 @@ mod tests {
                 frn: 1,
                 parent_frn: 1,
                 name: "\\".to_string(),
+                name_lower: "\\".to_string(),
                 attributes: 0x10,
             },
         );
@@ -311,6 +358,7 @@ mod tests {
                 frn: 2,
                 parent_frn: 1,
                 name: "src".to_string(),
+                name_lower: "src".to_string(),
                 attributes: 0x10,
             },
         );
@@ -320,6 +368,7 @@ mod tests {
                 frn: 3,
                 parent_frn: 2,
                 name: "main.rs".to_string(),
+                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );
@@ -355,6 +404,7 @@ mod tests {
                 frn: 2,
                 parent_frn: 5,
                 name: "src".to_string(),
+                name_lower: "src".to_string(),
                 attributes: 0x10,
             },
         );
@@ -364,6 +414,7 @@ mod tests {
                 frn: 3,
                 parent_frn: 2,
                 name: "main.rs".to_string(),
+                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );
@@ -388,6 +439,7 @@ mod tests {
                 frn: 1,
                 parent_frn: 1,
                 name: "\\".to_string(),
+                name_lower: "\\".to_string(),
                 attributes: 0x10,
             },
         );
@@ -397,6 +449,7 @@ mod tests {
                 frn: 2,
                 parent_frn: 1,
                 name: "src".to_string(),
+                name_lower: "src".to_string(),
                 attributes: 0x10,
             },
         );
@@ -406,6 +459,7 @@ mod tests {
                 frn: 3,
                 parent_frn: 2,
                 name: "main.rs".to_string(),
+                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );
@@ -415,6 +469,7 @@ mod tests {
                 frn: 4,
                 parent_frn: 1,
                 name: "src2".to_string(),
+                name_lower: "src2".to_string(),
                 attributes: 0x10,
             },
         );
@@ -424,6 +479,7 @@ mod tests {
                 frn: 5,
                 parent_frn: 4,
                 name: "main.rs".to_string(),
+                name_lower: "main.rs".to_string(),
                 attributes: 0,
             },
         );

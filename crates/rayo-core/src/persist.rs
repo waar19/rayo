@@ -50,8 +50,9 @@ pub fn load_index(path: impl AsRef<Path>) -> Result<FileIndex> {
     let path = path.as_ref();
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
-    let index: FileIndex = bincode::deserialize_from(reader)
+    let mut index: FileIndex = bincode::deserialize_from(reader)
         .with_context(|| format!("failed to deserialize index at {}", path.display()))?;
+    index.rebuild_lowercase_cache();
     Ok(index)
 }
 
@@ -85,6 +86,7 @@ mod tests {
                 frn: 10,
                 parent_frn: 5,
                 name: "demo.txt".to_string(),
+                name_lower: "demo.txt".to_string(),
                 attributes: 0,
             },
         );
@@ -115,6 +117,7 @@ mod tests {
                 frn: 1,
                 parent_frn: 1,
                 name: "old.txt".to_string(),
+                name_lower: "old.txt".to_string(),
                 attributes: 0,
             },
         );
@@ -135,6 +138,7 @@ mod tests {
                 frn: 2,
                 parent_frn: 1,
                 name: "new.txt".to_string(),
+                name_lower: "new.txt".to_string(),
                 attributes: 0,
             },
         );

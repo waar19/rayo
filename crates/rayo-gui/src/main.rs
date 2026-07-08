@@ -36,7 +36,7 @@ struct Cli {
     pipe: String,
     #[arg(long, default_value_t = 200)]
     limit: usize,
-    #[arg(long, default_value_t = 80)]
+    #[arg(long, default_value_t = 25)]
     debounce_ms: u64,
 }
 
@@ -116,6 +116,44 @@ fn query_service(pipe_name: &str, request: &QueryRequest) -> Result<QueryRespons
     Ok(response)
 }
 
+fn can_connect_pipe(pipe_name: &str) -> bool {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(pipe_name)
+        .is_ok()
+}
+
+fn ensure_fallback_index_loaded(
+    config: &GuiConfig,
+    fallback_index: &Arc<RwLock<Option<FileIndex>>>,
+) -> Result<usize> {
+    {
+        let guard = match fallback_index.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(index) = guard.as_ref() {
+            return Ok(index.entries.len());
+        }
+    }
+
+    let mut guard = match fallback_index.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.is_none() {
+        let index = load_index(&config.index_path).with_context(|| {
+            format!(
+                "failed to load fallback index {}",
+                config.index_path.display()
+            )
+        })?;
+        *guard = Some(index);
+    }
+    Ok(guard.as_ref().map(|index| index.entries.len()).unwrap_or(0))
+}
+
 fn shell_open(path: &str, as_admin: bool) -> Result<()> {
     let verb = if as_admin { "runas" } else { "open" };
     let verb_w = to_utf16_null(verb);
@@ -184,50 +222,29 @@ fn run_search(
         limit: Some(config.limit),
     };
 
-    let (raw_results, took_ms, total_entries, mode_text) = match query_service(
-        &config.pipe_name,
-        &request,
-    ) {
-        Ok(response) => (
-            response.results,
-            response.took_ms,
-            response.total_entries,
-            "service".to_string(),
-        ),
-        Err(service_err) => {
-            let started = Instant::now();
-            let loaded = {
-                let has_index = fallback_index
-                    .read()
-                    .ok()
-                    .and_then(|guard| guard.as_ref().map(|_| true))
-                    .unwrap_or(false);
-                if !has_index {
-                    let loaded = load_index(&config.index_path).with_context(|| {
-                        format!(
-                            "failed to load fallback index {}",
-                            config.index_path.display()
-                        )
-                    });
-                    match loaded {
-                        Ok(index) => {
-                            if let Ok(mut guard) = fallback_index.write() {
-                                *guard = Some(index);
-                            }
-                        }
-                        Err(err) => {
-                            return UiPayload {
-                                rows: Vec::new(),
-                                paths: Vec::new(),
-                                status_text: format!(
-                                    "Service unavailable ({service_err}). Fallback failed: {err}"
-                                ),
-                                mode_text: "error".to_string(),
-                            };
-                        }
+    let (raw_results, took_ms, total_entries, mode_text) =
+        match query_service(&config.pipe_name, &request) {
+            Ok(response) => (
+                response.results,
+                response.took_ms,
+                response.total_entries,
+                "service".to_string(),
+            ),
+            Err(service_err) => {
+                let started = Instant::now();
+                let total_entries = match ensure_fallback_index_loaded(config, fallback_index) {
+                    Ok(total_entries) => total_entries,
+                    Err(err) => {
+                        return UiPayload {
+                            rows: Vec::new(),
+                            paths: Vec::new(),
+                            status_text: format!(
+                                "Service unavailable ({service_err}). Fallback failed: {err}"
+                            ),
+                            mode_text: "error".to_string(),
+                        };
                     }
-                }
-
+                };
                 let guard = match fallback_index.read() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
@@ -258,13 +275,11 @@ fn run_search(
                         })
                         .collect::<Vec<_>>(),
                     started.elapsed().as_millis(),
-                    index.entries.len(),
+                    total_entries,
                     format!("fallback ({service_err})"),
                 )
-            };
-            loaded
-        }
-    };
+            }
+        };
 
     let mut rows = Vec::with_capacity(raw_results.len());
     let mut paths = Vec::with_capacity(raw_results.len());
@@ -328,7 +343,7 @@ fn main() -> Result<()> {
         pipe_name: cli.pipe,
         under_dir: cli.under,
         limit: cli.limit.max(1),
-        debounce_ms: cli.debounce_ms.max(40),
+        debounce_ms: cli.debounce_ms.max(15),
     });
     let fallback_index: Arc<RwLock<Option<FileIndex>>> = Arc::new(RwLock::new(None));
     let latest_request = Arc::new(AtomicU64::new(0));
@@ -342,6 +357,47 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| "<none>".to_string())
             .into(),
     );
+
+    {
+        let preload_config = config.clone();
+        let preload_index = fallback_index.clone();
+        let preload_ui = ui.as_weak();
+        thread::spawn(move || {
+            if can_connect_pipe(&preload_config.pipe_name) {
+                return;
+            }
+
+            let preload_ui_loading = preload_ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = preload_ui_loading.upgrade()
+                    && ui.get_query().trim().is_empty()
+                {
+                    ui.set_mode_text("fallback (preloading)".into());
+                    ui.set_status_text("Loading local index...".into());
+                }
+            });
+
+            let preload_result = ensure_fallback_index_loaded(&preload_config, &preload_index)
+                .map_err(|err| err.to_string());
+            let preload_ui_done = preload_ui.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = preload_ui_done.upgrade()
+                    && ui.get_query().trim().is_empty()
+                {
+                    match preload_result {
+                        Ok(total_entries) => {
+                            ui.set_mode_text(format!("fallback | indexed={total_entries}").into());
+                            ui.set_status_text("Type at least 2 characters to search.".into());
+                        }
+                        Err(err) => {
+                            ui.set_mode_text("error".into());
+                            ui.set_status_text(format!("Fallback preload failed: {err}").into());
+                        }
+                    }
+                }
+            });
+        });
+    }
 
     let debounce_timer = Rc::new(RefCell::new(Timer::default()));
 
