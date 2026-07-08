@@ -1,6 +1,7 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
-use std::path::Path;
+use std::io::{BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -12,11 +13,36 @@ pub fn save_index(index: &FileIndex, path: impl AsRef<Path>) -> Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("no se pudo crear carpeta {}", parent.display()))?;
     }
-    let file =
-        File::create(path).with_context(|| format!("no se pudo crear {}", path.display()))?;
-    let writer = BufWriter::new(file);
-    bincode::serialize_into(writer, index)
-        .with_context(|| format!("no se pudo serializar indice a {}", path.display()))?;
+    let temp_path = build_temp_index_path(path);
+    let file = File::create(&temp_path)
+        .with_context(|| format!("no se pudo crear temporal {}", temp_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    bincode::serialize_into(&mut writer, index)
+        .with_context(|| format!("no se pudo serializar indice a {}", temp_path.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("no se pudo vaciar buffer {}", temp_path.display()))?;
+    let file = writer
+        .into_inner()
+        .map_err(|err| err.into_error())
+        .with_context(|| format!("no se pudo finalizar escritura {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("no se pudo sincronizar {}", temp_path.display()))?;
+
+    if path.exists() {
+        std::fs::remove_file(path)
+            .with_context(|| format!("no se pudo reemplazar {}", path.display()))?;
+    }
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err).with_context(|| {
+            format!(
+                "no se pudo mover temporal {} a {}",
+                temp_path.display(),
+                path.display()
+            )
+        });
+    }
     Ok(())
 }
 
@@ -27,6 +53,19 @@ pub fn load_index(path: impl AsRef<Path>) -> Result<FileIndex> {
     let index: FileIndex = bincode::deserialize_from(reader)
         .with_context(|| format!("no se pudo deserializar indice en {}", path.display()))?;
     Ok(index)
+}
+
+fn build_temp_index_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("index.rayo");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_name = format!("{file_name}.tmp-{}-{stamp}", std::process::id());
+    path.with_file_name(temp_name)
 }
 
 #[cfg(test)]
@@ -65,5 +104,48 @@ mod tests {
         assert_eq!(loaded.drive, "C:");
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.journal_id, 77);
+    }
+
+    #[test]
+    fn save_index_replaces_existing_file() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            1,
+            FileEntry {
+                frn: 1,
+                parent_frn: 1,
+                name: "old.txt".to_string(),
+                attributes: 0,
+            },
+        );
+        let mut index = FileIndex {
+            drive: "C:".to_string(),
+            entries,
+            journal_id: 10,
+            next_usn: 20,
+            indexed_at_epoch_secs: 30,
+        };
+
+        let path = std::env::temp_dir().join("rayo-atomic-save-test.rayo");
+        save_index(&index, &path).expect("save old");
+
+        index.entries.insert(
+            2,
+            FileEntry {
+                frn: 2,
+                parent_frn: 1,
+                name: "new.txt".to_string(),
+                attributes: 0,
+            },
+        );
+        index.journal_id = 11;
+        save_index(&index, &path).expect("save new");
+
+        let loaded = load_index(&path).expect("load new");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.journal_id, 11);
+        assert_eq!(loaded.entries.len(), 2);
+        assert!(loaded.entries.contains_key(&2));
     }
 }

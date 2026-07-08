@@ -81,8 +81,19 @@ fn run_index(drive: &str, output: PathBuf) -> Result<()> {
     require_admin()?;
     let drive = normalize_drive(drive)?;
     let started = Instant::now();
+    println!(
+        "Iniciando indexado en {}. Esto puede tardar varios minutos...",
+        drive
+    );
+    let build_started = Instant::now();
     let index = FileIndex::build(&drive)?;
+    println!(
+        "Lectura de MFT/Journaling completada en {:?}. Guardando indice...",
+        build_started.elapsed()
+    );
+    let save_started = Instant::now();
     save_index(&index, &output)?;
+    println!("Indice persistido en {:?}", save_started.elapsed());
     println!(
         "Indice generado: {} entradas en {:?} -> {}",
         index.entries.len(),
@@ -126,16 +137,31 @@ fn run_search(
 fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
     require_admin()?;
     let drive = normalize_drive(drive)?;
+    println!(
+        "Preparando watch en {}. Bootstrap inicial puede tardar...",
+        drive
+    );
     let mut index = if index_path.exists() {
+        println!("Cargando indice existente: {}", index_path.display());
         let loaded = load_index(&index_path)?;
         if loaded.drive.eq_ignore_ascii_case(&drive) {
+            println!("Indice existente compatible ({})", loaded.drive);
             loaded
         } else {
+            println!(
+                "Indice actual pertenece a {}. Reconstruyendo para {}...",
+                loaded.drive, drive
+            );
             FileIndex::build(&drive)?
         }
     } else {
+        println!(
+            "No existe indice en {}. Construyendo indice inicial...",
+            index_path.display()
+        );
         FileIndex::build(&drive)?
     };
+    println!("Guardando snapshot inicial de watch...");
     save_index(&index, &index_path)?;
     println!(
         "Watch iniciado en {} ({} entradas). Ctrl+C para salir.",
