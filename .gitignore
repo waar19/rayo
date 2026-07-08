@@ -1,3 +1,7 @@
 /target
 *.rayo
 *.bin
+*.log
+*.err
+elev-check.txt
+rayo_watch_validation*/
