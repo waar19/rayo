@@ -52,30 +52,55 @@ cargo run -p rayo-service -- --drive C --index .\c.rayo
 # Abrir GUI (intenta servicio, si no fallback al índice local)
 cargo run -p rayo-gui -- --index .\c.rayo
 
-# Opcional: instalar menú contextual de Explorer para usuario actual
+# Opcional: instalar menús contextuales de Explorer (archivo/carpeta/fondo)
 cargo run -p rayo-cli -- shell install --gui-path .\target\debug\rayo-gui.exe
+
+# Diagnóstico de integración shell
+cargo run -p rayo-cli -- shell doctor --gui-path .\target\debug\rayo-gui.exe
 ```
 
 ### Acciones de GUI
 
 - Selecciona una fila y usa botones: `Open`, `Open as admin`, `Open folder`, `Copy path`.
-- Búsqueda con debounce (~80 ms por defecto) para no congelar mientras escribes.
+- Panel de Settings integrado para ajustar alcance, extensión, modo, límite y debounce.
+- Atajos de teclado: `Ctrl+,` abre Settings y `Esc` cierra Settings.
 - Consultas vacías o de 1 caracter no disparan búsqueda completa salvo que uses `--under`.
+
+### Flags contextuales de GUI
+
+- `--under <ruta>`: abre la GUI acotada a una carpeta (útil desde Explorer).
+- `--query <texto>`: precarga la caja de búsqueda.
+- `--open <ruta>`: deriva el contexto desde un archivo/carpeta para flujo de click derecho.
+
+### Modo trigrama opcional
+
+Para queries largas, el modo trigrama puede reducir mucho la latencia de la primera búsqueda:
+
+```powershell
+# CLI puntual
+cargo run --release -p rayo-cli -- search --index .\c.rayo --query tickettrack --trigram
+
+# Modo de servicio (clientes por named pipe)
+cargo run -p rayo-service -- --drive C --index .\c.rayo --trigram --metrics-interval-secs 30
+```
+
+Tradeoff: el índice por trigrama usa más RAM, pero acelera consultas largas/poco frecuentes.
 
 ## Resultados de validación (Windows 11, C:, Jul 2026)
 
 Validación real sobre `C:` NTFS en terminal elevada:
 
-- Indexado inicial a `c-base.rayo`: `INDEX_WALL_MS=133246` (~2m13s).
-- Tamaño del índice: `364427087` bytes (~347.5 MiB).
-- Entradas cargadas al iniciar watch: `6192118`.
+- Tamaño del índice: ~`365 MB`.
+- Entradas cargadas: ~`6.2M`.
 
-Muestras de latencia de búsqueda sobre índice real:
+Muestras de latencia de búsqueda sobre índice real (release):
 
-- `--query report --limit 20`: `20` resultados en `2.4751112s` (wall-clock `15315 ms`).
-- `--query report --ext pdf --limit 20`: `20` resultados en `1.9989417s` (wall-clock `17261 ms`).
-- `--query system --under C:\Windows --limit 20`: `20` resultados en `2.7214587s` (wall-clock `18455 ms`).
-- `--query kernel --glob "**/*.dll" --limit 20`: `20` resultados en `2.2629864s` (wall-clock `16657 ms`).
+- `--query report --limit 20`: `20` resultados en `6.673 ms`.
+- `--query report --limit 20 --trigram`: `20` resultados en `6.644 ms`.
+- `--query tickettrack --limit 20`: `1` resultado en `7.685 ms`.
+- `--query tickettrack --limit 20 --trigram`: `1` resultado en `0.502 ms`.
+- `--query zzzqqxxnotfound --limit 20`: `0` resultados en `7.321 ms`.
+- `--query zzzqqxxnotfound --limit 20 --trigram`: `0` resultados en `0.026 ms`.
 
 La validación de watch cubrió creación, renombrado y borrado de archivos.
 
@@ -83,7 +108,7 @@ Validación de servicio + integración:
 
 - `rayo-service` inició elevado con índice existente y expuso `\\.\pipe\rayo-query`.
 - Consulta no elevada por named pipe devolvió resultados JSON correctamente.
-- `rayo-cli shell install` y `shell uninstall` crearon y removieron entradas de menú contextual en `HKCU\Software\Classes`.
+- `rayo-cli shell install`, `shell doctor` y `shell uninstall` validaron la integración de Explorer para archivo/carpeta/fondo en `HKCU\Software\Classes`.
 
 ## Hoja de ruta
 
@@ -102,6 +127,17 @@ Validación de servicio + integración:
 - Integraciones potenciales:
   - plugin de PowerToys Run,
   - acción de menú contextual en Explorer ("Search with Rayo here").
+
+## CI y empaquetado de release
+
+- Pipeline de CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) ejecuta `fmt`, `test` y build release en Windows.
+- Helper de empaquetado Windows: [`scripts/release-windows.ps1`](scripts/release-windows.ps1)
+
+```powershell
+pwsh .\scripts\release-windows.ps1
+```
+
+Esto genera `dist/rayo-windows.zip` con `rayo-cli.exe`, `rayo-service.exe`, `rayo-gui.exe` y documentación.
 
 ## Licencia
 

@@ -45,6 +45,8 @@ enum Commands {
         files_only: bool,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        #[arg(long, default_value_t = false)]
+        trigram: bool,
     },
     /// Keep index up to date from USN Journal
     Watch {
@@ -69,6 +71,10 @@ enum ShellAction {
         gui_path: Option<PathBuf>,
     },
     Uninstall,
+    Doctor {
+        #[arg(long)]
+        gui_path: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -84,7 +90,10 @@ fn main() -> Result<()> {
             dirs_only,
             files_only,
             limit,
-        } => run_search(index, query, ext, under, glob, dirs_only, files_only, limit),
+            trigram,
+        } => run_search(
+            index, query, ext, under, glob, dirs_only, files_only, limit, trigram,
+        ),
         Commands::Watch {
             drive,
             index,
@@ -130,8 +139,10 @@ fn run_search(
     dirs_only: bool,
     files_only: bool,
     limit: usize,
+    trigram: bool,
 ) -> Result<()> {
-    let index = load_index(&index_path)?;
+    let mut index = load_index(&index_path)?;
+    index.set_trigram_enabled(trigram);
     let started = Instant::now();
     let results = index.search(&SearchOptions {
         query,
@@ -141,6 +152,7 @@ fn run_search(
         directories_only: dirs_only,
         files_only,
         limit,
+        prefer_trigram: trigram,
     });
 
     for result in &results {
@@ -222,27 +234,33 @@ fn run_shell(action: ShellAction) -> Result<()> {
     match action {
         ShellAction::Install { gui_path } => install_shell_integration(gui_path),
         ShellAction::Uninstall => uninstall_shell_integration(),
+        ShellAction::Doctor { gui_path } => run_shell_doctor(gui_path),
     }
 }
 
 fn install_shell_integration(gui_path: Option<PathBuf>) -> Result<()> {
     let gui_exe = resolve_gui_path(gui_path)?;
-    let gui_command = format!("\"{}\" --under", gui_exe.display());
+    let gui_under_command = format!("\"{}\" --under", gui_exe.display());
+    let gui_open_command = format!("\"{}\" --open", gui_exe.display());
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
-    let dir_shell =
-        r"Software\Classes\Directory\shell\RayoSearch";
+    let dir_shell = r"Software\Classes\Directory\shell\RayoSearch";
     let (dir_key, _) = hkcu.create_subkey(dir_shell)?;
     dir_key.set_value("", &"Search with Rayo here")?;
     let (dir_command_key, _) = dir_key.create_subkey("command")?;
-    dir_command_key.set_value("", &format!("{gui_command} \"%1\""))?;
+    dir_command_key.set_value("", &format!("{gui_under_command} \"%1\""))?;
 
-    let bg_shell =
-        r"Software\Classes\Directory\Background\shell\RayoSearch";
+    let bg_shell = r"Software\Classes\Directory\Background\shell\RayoSearch";
     let (bg_key, _) = hkcu.create_subkey(bg_shell)?;
     bg_key.set_value("", &"Search with Rayo here")?;
     let (bg_command_key, _) = bg_key.create_subkey("command")?;
-    bg_command_key.set_value("", &format!("{gui_command} \"%V\""))?;
+    bg_command_key.set_value("", &format!("{gui_under_command} \"%V\""))?;
+
+    let file_shell = r"Software\Classes\*\shell\RayoSearch";
+    let (file_key, _) = hkcu.create_subkey(file_shell)?;
+    file_key.set_value("", &"Search with Rayo for similar files")?;
+    let (file_command_key, _) = file_key.create_subkey("command")?;
+    file_command_key.set_value("", &format!("{gui_open_command} \"%1\""))?;
 
     println!("Explorer context menu installed for current user.");
     println!("Windows 11 note: entry appears under 'Show more options'.");
@@ -251,15 +269,58 @@ fn install_shell_integration(gui_path: Option<PathBuf>) -> Result<()> {
 
 fn uninstall_shell_integration() -> Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let dir_shell =
-        r"Software\Classes\Directory\shell\RayoSearch";
-    let bg_shell =
-        r"Software\Classes\Directory\Background\shell\RayoSearch";
+    let dir_shell = r"Software\Classes\Directory\shell\RayoSearch";
+    let bg_shell = r"Software\Classes\Directory\Background\shell\RayoSearch";
+    let file_shell = r"Software\Classes\*\shell\RayoSearch";
 
     let _ = hkcu.delete_subkey_all(dir_shell);
     let _ = hkcu.delete_subkey_all(bg_shell);
+    let _ = hkcu.delete_subkey_all(file_shell);
 
     println!("Explorer context menu removed for current user.");
+    Ok(())
+}
+
+fn run_shell_doctor(gui_path: Option<PathBuf>) -> Result<()> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let gui_exe = resolve_gui_path(gui_path)?;
+    println!("GUI executable: {}", gui_exe.display());
+    println!("GUI exists: {}", gui_exe.exists());
+
+    let checks = [
+        (
+            "Directory context menu",
+            r"Software\Classes\Directory\shell\RayoSearch\command",
+        ),
+        (
+            "Directory background context menu",
+            r"Software\Classes\Directory\Background\shell\RayoSearch\command",
+        ),
+        (
+            "File context menu",
+            r"Software\Classes\*\shell\RayoSearch\command",
+        ),
+    ];
+
+    let mut missing = 0usize;
+    for (label, key_path) in checks {
+        match hkcu.open_subkey(key_path) {
+            Ok(key) => {
+                let command: String = key.get_value("").unwrap_or_default();
+                println!("[OK] {label}: {command}");
+            }
+            Err(_) => {
+                missing += 1;
+                println!("[MISSING] {label}: {key_path}");
+            }
+        }
+    }
+
+    if missing > 0 {
+        println!("Shell doctor: {missing} integration item(s) missing.");
+    } else {
+        println!("Shell doctor: all Explorer integration entries look healthy.");
+    }
     Ok(())
 }
 

@@ -98,6 +98,7 @@ mod tests {
             next_usn: 123,
             indexed_at_epoch_secs: 999,
             search_arena: SearchArena::default(),
+            trigram_index: None,
         };
         index.rebuild_search_arena();
 
@@ -130,6 +131,7 @@ mod tests {
             next_usn: 20,
             indexed_at_epoch_secs: 30,
             search_arena: SearchArena::default(),
+            trigram_index: None,
         };
         index.rebuild_search_arena();
 

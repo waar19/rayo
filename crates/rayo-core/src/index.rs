@@ -35,6 +35,70 @@ pub(crate) struct SearchArena {
     slot_by_frn: HashMap<u64, usize>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct TrigramIndex {
+    postings: HashMap<u32, Vec<u64>>,
+}
+
+impl TrigramIndex {
+    fn from_entries<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Self {
+        let mut postings: HashMap<u32, Vec<u64>> = HashMap::new();
+        for entry in entries {
+            let lowered = entry.name.to_ascii_lowercase();
+            let grams = trigrams_from_lower(&lowered);
+            if grams.is_empty() {
+                continue;
+            }
+            for gram in grams {
+                postings.entry(gram).or_default().push(entry.frn);
+            }
+        }
+
+        for ids in postings.values_mut() {
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        Self { postings }
+    }
+
+    fn query_candidates(&self, query_lower: &str, max_candidates: usize) -> Vec<u64> {
+        if max_candidates == 0 {
+            return Vec::new();
+        }
+
+        let grams = trigrams_from_lower(query_lower);
+        if grams.is_empty() {
+            return Vec::new();
+        }
+
+        let mut posting_lists: Vec<&Vec<u64>> = grams
+            .iter()
+            .filter_map(|gram| self.postings.get(gram))
+            .collect();
+        if posting_lists.len() != grams.len() {
+            return Vec::new();
+        }
+
+        posting_lists.sort_by_key(|list| list.len());
+        let seed = posting_lists[0];
+        let rest = &posting_lists[1..];
+
+        let mut matches = Vec::with_capacity(seed.len().min(max_candidates));
+        'seed_loop: for frn in seed {
+            for list in rest {
+                if list.binary_search(frn).is_err() {
+                    continue 'seed_loop;
+                }
+            }
+            matches.push(*frn);
+            if matches.len() >= max_candidates {
+                break;
+            }
+        }
+        matches
+    }
+}
+
 impl SearchArena {
     fn from_entries<'a>(entries: impl Iterator<Item = &'a FileEntry>) -> Self {
         let mut arena = Self::default();
@@ -197,10 +261,13 @@ pub struct FileIndex {
     pub indexed_at_epoch_secs: u64,
     #[serde(skip, default)]
     pub(crate) search_arena: SearchArena,
+    #[serde(skip, default)]
+    pub(crate) trigram_index: Option<TrigramIndex>,
 }
 
 const NTFS_FILE_REFERENCE_INDEX_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 const NTFS_ROOT_DIRECTORY_INDEX: u64 = 5;
+const TRIGRAM_MIN_QUERY_LEN: usize = 8;
 
 impl FileIndex {
     pub fn build(drive: &str) -> Result<Self> {
@@ -216,6 +283,7 @@ impl FileIndex {
                 .unwrap_or_default()
                 .as_secs(),
             search_arena: SearchArena::default(),
+            trigram_index: None,
         };
         index.rebuild_search_arena();
         Ok(index)
@@ -243,11 +311,30 @@ impl FileIndex {
         if self.search_arena.should_compact() {
             self.rebuild_search_arena();
         }
+        if !changes.events.is_empty() && self.trigram_index.is_some() {
+            self.rebuild_trigram_index();
+        }
         Ok(changes.events.len())
     }
 
     pub fn rebuild_search_arena(&mut self) {
         self.search_arena = SearchArena::from_entries(self.entries.values());
+    }
+
+    pub fn rebuild_trigram_index(&mut self) {
+        self.trigram_index = Some(TrigramIndex::from_entries(self.entries.values()));
+    }
+
+    pub fn set_trigram_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self.rebuild_trigram_index();
+        } else {
+            self.trigram_index = None;
+        }
+    }
+
+    pub fn trigram_enabled(&self) -> bool {
+        self.trigram_index.is_some()
     }
 
     pub fn resolve_path(&self, frn: u64) -> Option<String> {
@@ -308,11 +395,22 @@ impl FileIndex {
             .as_ref()
             .and_then(|pattern| build_glob(pattern).ok());
 
+        let trigram_candidate_limit = candidate_limit.saturating_mul(32).max(candidate_limit);
+        let candidate_frns =
+            if options.prefer_trigram && normalized_query.len() >= TRIGRAM_MIN_QUERY_LEN {
+                if let Some(trigram) = &self.trigram_index {
+                    trigram.query_candidates(&normalized_query, trigram_candidate_limit)
+                } else {
+                    self.search_arena
+                        .candidate_frns(&normalized_query, candidate_limit)
+                }
+            } else {
+                self.search_arena
+                    .candidate_frns(&normalized_query, candidate_limit)
+            };
+
         let mut results = Vec::new();
-        for frn in self
-            .search_arena
-            .candidate_frns(&normalized_query, candidate_limit)
-        {
+        for frn in candidate_frns {
             let Some(entry) = self.entries.get(&frn) else {
                 continue;
             };
@@ -379,6 +477,26 @@ fn build_glob(pattern: &str) -> Result<GlobMatcher> {
     Ok(glob.compile_matcher())
 }
 
+fn trigrams_from_lower(value: &str) -> Vec<u32> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut seen = HashSet::new();
+    let mut grams = Vec::new();
+    for window in bytes.windows(3) {
+        if window.contains(&0) {
+            continue;
+        }
+        let gram = ((window[0] as u32) << 16) | ((window[1] as u32) << 8) | (window[2] as u32);
+        if seen.insert(gram) {
+            grams.push(gram);
+        }
+    }
+    grams
+}
+
 fn compare_relevance(a: &SearchResult, b: &SearchResult, query_lower: &str) -> std::cmp::Ordering {
     relevance_key(a, query_lower)
         .cmp(&relevance_key(b, query_lower))
@@ -440,6 +558,7 @@ pub struct SearchOptions {
     pub directories_only: bool,
     pub files_only: bool,
     pub limit: usize,
+    pub prefer_trigram: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +677,7 @@ mod tests {
             next_usn: 0,
             indexed_at_epoch_secs: 0,
             search_arena: SearchArena::default(),
+            trigram_index: None,
         };
         index.rebuild_search_arena();
 
@@ -569,6 +689,7 @@ mod tests {
             directories_only: false,
             files_only: true,
             limit: 10,
+            prefer_trigram: false,
         });
 
         assert_eq!(results.len(), 1);
@@ -604,6 +725,7 @@ mod tests {
             next_usn: 0,
             indexed_at_epoch_secs: 0,
             search_arena: SearchArena::default(),
+            trigram_index: None,
         };
         index.rebuild_search_arena();
 
@@ -666,6 +788,7 @@ mod tests {
             next_usn: 0,
             indexed_at_epoch_secs: 0,
             search_arena: SearchArena::default(),
+            trigram_index: None,
         };
         index.rebuild_search_arena();
 
@@ -677,9 +800,68 @@ mod tests {
             directories_only: false,
             files_only: true,
             limit: 10,
+            prefer_trigram: false,
         });
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].path, "C:\\src\\main.rs");
+    }
+
+    #[test]
+    fn trigram_mode_finds_expected_match() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            1,
+            FileEntry {
+                frn: 1,
+                parent_frn: 1,
+                name: "\\".to_string(),
+                attributes: 0x10,
+            },
+        );
+        entries.insert(
+            2,
+            FileEntry {
+                frn: 2,
+                parent_frn: 1,
+                name: "Reports".to_string(),
+                attributes: 0x10,
+            },
+        );
+        entries.insert(
+            3,
+            FileEntry {
+                frn: 3,
+                parent_frn: 2,
+                name: "ticket_report_2026.pdf".to_string(),
+                attributes: 0,
+            },
+        );
+
+        let mut index = FileIndex {
+            drive: "C:".to_string(),
+            entries,
+            journal_id: 1,
+            next_usn: 0,
+            indexed_at_epoch_secs: 0,
+            search_arena: SearchArena::default(),
+            trigram_index: None,
+        };
+        index.rebuild_search_arena();
+        index.set_trigram_enabled(true);
+
+        let results = index.search(&SearchOptions {
+            query: "report".to_string(),
+            extension: Some("pdf".to_string()),
+            under_dir: Some("C:\\Reports".to_string()),
+            glob: None,
+            directories_only: false,
+            files_only: true,
+            limit: 10,
+            prefer_trigram: true,
+        });
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "C:\\Reports\\ticket_report_2026.pdf");
     }
 }

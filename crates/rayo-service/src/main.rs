@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +50,10 @@ struct Cli {
     persist_every_changes: usize,
     #[arg(long, default_value_t = 100)]
     default_limit: usize,
+    #[arg(long, default_value_t = false)]
+    trigram: bool,
+    #[arg(long, default_value_t = 30)]
+    metrics_interval_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,12 +82,25 @@ struct QueryResponse {
     results: Vec<QueryResultDto>,
 }
 
+#[derive(Debug, Default)]
+struct ServiceMetrics {
+    requests_total: u64,
+    total_took_ms: u128,
+    last_took_ms: u128,
+    max_took_ms: u128,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     require_admin()?;
     let drive = normalize_drive(&cli.drive)?;
 
-    let index = load_or_build_index(&drive, &cli.index)?;
+    let mut index = load_or_build_index(&drive, &cli.index)?;
+    if cli.trigram {
+        let trigram_started = Instant::now();
+        index.set_trigram_enabled(true);
+        println!("Trigram index enabled in {:?}.", trigram_started.elapsed());
+    }
     save_index(&index, &cli.index)
         .with_context(|| format!("failed to save bootstrap index at {}", cli.index.display()))?;
     println!(
@@ -92,6 +110,7 @@ fn main() -> Result<()> {
     );
 
     let index = Arc::new(RwLock::new(index));
+    let metrics = Arc::new(Mutex::new(ServiceMetrics::default()));
     let running = Arc::new(AtomicBool::new(true));
     let running_handler = running.clone();
     ctrlc::set_handler(move || {
@@ -114,10 +133,24 @@ fn main() -> Result<()> {
         );
     });
 
+    let metrics_running = running.clone();
+    let metrics_index = index.clone();
+    let metrics_state = metrics.clone();
+    let metrics_interval = Duration::from_secs(cli.metrics_interval_secs.max(5));
+    let metrics_thread = thread::spawn(move || {
+        run_metrics_reporter(
+            metrics_state,
+            metrics_index,
+            metrics_running,
+            metrics_interval,
+        );
+    });
+
     println!("Named pipe listening on {PIPE_NAME}");
-    let pipe_result = run_pipe_server(index, running.clone(), cli.default_limit.max(1));
+    let pipe_result = run_pipe_server(index, running.clone(), metrics, cli.default_limit.max(1));
     running.store(false, Ordering::SeqCst);
     let _ = watch_thread.join();
+    let _ = metrics_thread.join();
     pipe_result
 }
 
@@ -215,6 +248,7 @@ fn run_watch_loop(
 fn run_pipe_server(
     index: Arc<RwLock<FileIndex>>,
     running: Arc<AtomicBool>,
+    metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
 ) -> Result<()> {
     while running.load(Ordering::SeqCst) {
@@ -230,10 +264,12 @@ fn run_pipe_server(
         }
 
         let shared_index = index.clone();
+        let shared_metrics = metrics.clone();
         let pipe_raw = pipe.0 as isize;
         thread::spawn(move || {
             let pipe = HANDLE(pipe_raw as *mut c_void);
-            if let Err(err) = handle_pipe_client(pipe, shared_index, default_limit) {
+            if let Err(err) = handle_pipe_client(pipe, shared_index, shared_metrics, default_limit)
+            {
                 eprintln!("pipe client error: {err:#}");
             }
         });
@@ -291,6 +327,7 @@ fn pipe_security_attributes() -> Result<SECURITY_ATTRIBUTES> {
 fn handle_pipe_client(
     pipe: HANDLE,
     index: Arc<RwLock<FileIndex>>,
+    metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
 ) -> Result<()> {
     let owned = unsafe { OwnedHandle::from_raw_handle(pipe.0 as *mut _) };
@@ -313,7 +350,7 @@ fn handle_pipe_client(
         let request: QueryRequest =
             serde_json::from_str(request_line.trim_end()).context("invalid JSON request")?;
         let limit = request.limit.unwrap_or(default_limit).max(1);
-        let options = SearchOptions {
+        let mut options = SearchOptions {
             query: request.query,
             extension: request.extension,
             under_dir: request.under_dir,
@@ -321,6 +358,7 @@ fn handle_pipe_client(
             directories_only: request.directories_only,
             files_only: request.files_only,
             limit,
+            prefer_trigram: false,
         };
 
         let started = Instant::now();
@@ -329,10 +367,18 @@ fn handle_pipe_client(
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            options.prefer_trigram = guard.trigram_enabled();
             (guard.search(&options), guard.entries.len())
         };
+        let took_ms = started.elapsed().as_millis();
+        if let Ok(mut guard) = metrics.lock() {
+            guard.requests_total += 1;
+            guard.total_took_ms += took_ms;
+            guard.last_took_ms = took_ms;
+            guard.max_took_ms = guard.max_took_ms.max(took_ms);
+        }
         let response = QueryResponse {
-            took_ms: started.elapsed().as_millis(),
+            took_ms,
             total_entries,
             results: results
                 .into_iter()
@@ -350,6 +396,48 @@ fn handle_pipe_client(
         stream.flush().context("failed to flush response")?;
     }
     Ok(())
+}
+
+fn run_metrics_reporter(
+    metrics: Arc<Mutex<ServiceMetrics>>,
+    index: Arc<RwLock<FileIndex>>,
+    running: Arc<AtomicBool>,
+    interval: Duration,
+) {
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(interval);
+        let entries = match index.read() {
+            Ok(guard) => guard.entries.len(),
+            Err(poisoned) => poisoned.into_inner().entries.len(),
+        };
+        let snapshot = match metrics.lock() {
+            Ok(guard) => ServiceMetrics {
+                requests_total: guard.requests_total,
+                total_took_ms: guard.total_took_ms,
+                last_took_ms: guard.last_took_ms,
+                max_took_ms: guard.max_took_ms,
+            },
+            Err(poisoned) => {
+                let guard = poisoned.into_inner();
+                ServiceMetrics {
+                    requests_total: guard.requests_total,
+                    total_took_ms: guard.total_took_ms,
+                    last_took_ms: guard.last_took_ms,
+                    max_took_ms: guard.max_took_ms,
+                }
+            }
+        };
+
+        let average_ms = if snapshot.requests_total == 0 {
+            0.0
+        } else {
+            snapshot.total_took_ms as f64 / snapshot.requests_total as f64
+        };
+        println!(
+            "[metrics] requests={} avg_ms={average_ms:.2} last_ms={} max_ms={} entries={entries}",
+            snapshot.requests_total, snapshot.last_took_ms, snapshot.max_took_ms
+        );
+    }
 }
 
 fn to_utf16_null(value: &str) -> Vec<u16> {

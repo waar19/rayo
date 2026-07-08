@@ -25,12 +25,16 @@ export component MainWindow inherits Window {
     in-out property <bool> settings-directories-only: false;
     in-out property <int> settings-limit: 200;
     in-out property <int> settings-debounce-ms: 10;
+    in-out property <string> settings-error-text: "";
+    in-out property <string> settings-hint: "";
+    forward-focus: keyboard-shortcuts;
 
     callback query-edited(string);
     callback search-now();
     callback open-settings();
     callback save-settings(string, string, bool, bool, int, int);
     callback cancel-settings();
+    callback reset-settings();
     callback select-row(int);
     callback activate-row(int);
     callback open-selected();
@@ -88,6 +92,13 @@ export component MainWindow inherits Window {
                     color: #8fa4bf;
                     vertical-alignment: center;
                     horizontal-stretch: 0;
+                }
+
+                Text {
+                    text: root.settings-hint;
+                    color: #8fa4bf;
+                    vertical-alignment: center;
+                    overflow: elide;
                 }
             }
         }
@@ -204,6 +215,12 @@ export component MainWindow inherits Window {
                                 placeholder-text: "Example: pdf";
                             }
 
+                            if root.settings-error-text != "" : Text {
+                                text: root.settings-error-text;
+                                color: #ff6b6b;
+                                font-size: 12px;
+                            }
+
                             HorizontalBox {
                                 spacing: 14px;
                                 CheckBox {
@@ -258,6 +275,11 @@ export component MainWindow inherits Window {
                             HorizontalBox {
                                 spacing: 8px;
                                 Rectangle { horizontal-stretch: 1; }
+                                Button {
+                                    text: "Reset";
+                                    horizontal-stretch: 0;
+                                    clicked => { root.reset-settings(); }
+                                }
                                 Button {
                                     text: "Cancel";
                                     horizontal-stretch: 0;
@@ -327,6 +349,20 @@ export component MainWindow inherits Window {
                     overflow: elide;
                 }
             }
+        }
+    }
+
+    keyboard-shortcuts := FocusScope {
+        capture-key-pressed(event) => {
+            if (event.modifiers.control && event.text == ",") {
+                root.open-settings();
+                return accept;
+            }
+            if (event.text == Key.Escape && root.show-settings) {
+                root.cancel-settings();
+                return accept;
+            }
+            return reject;
         }
     }
 }

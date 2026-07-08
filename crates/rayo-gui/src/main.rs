@@ -5,14 +5,14 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
@@ -35,6 +35,10 @@ struct Cli {
     index: PathBuf,
     #[arg(long)]
     under: Option<String>,
+    #[arg(long)]
+    query: Option<String>,
+    #[arg(long)]
+    open: Option<PathBuf>,
     #[arg(long, default_value = DEFAULT_PIPE)]
     pipe: String,
     #[arg(long)]
@@ -159,6 +163,31 @@ fn normalize_optional_text(input: String) -> Option<String> {
     }
 }
 
+fn file_name_query(path: &Path) -> Option<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|value| value.to_string())
+}
+
+fn apply_open_context(
+    open_path: &Path,
+    under_dir: &mut Option<String>,
+    query: &mut Option<String>,
+) {
+    if open_path.is_dir() {
+        *under_dir = Some(open_path.display().to_string());
+        return;
+    }
+
+    if let Some(parent) = open_path.parent() {
+        *under_dir = Some(parent.display().to_string());
+    }
+
+    if query.is_none() {
+        *query = file_name_query(open_path);
+    }
+}
+
 fn sanitize_settings(settings: &mut GuiSettings) {
     settings.under_dir = settings
         .under_dir
@@ -177,23 +206,70 @@ fn sanitize_settings(settings: &mut GuiSettings) {
     }
 }
 
+fn settings_hint(settings: &GuiSettings) -> String {
+    let scope = settings.under_dir.as_deref().unwrap_or("all");
+    let extension = settings.extension.as_deref().unwrap_or("*");
+    let mode = if settings.files_only {
+        "files"
+    } else if settings.directories_only {
+        "folders"
+    } else {
+        "all"
+    };
+    format!(
+        "scope={scope} ext={extension} mode={mode} limit={} debounce={}ms",
+        settings.limit, settings.debounce_ms
+    )
+}
+
+fn validate_settings(settings: &GuiSettings) -> Option<String> {
+    if let Some(extension) = settings.extension.as_ref() {
+        if !extension
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return Some("Extension filter only allows letters, numbers, '_' and '-'.".to_string());
+        }
+    }
+    if settings.files_only && settings.directories_only {
+        return Some("Choose either Files only or Folders only.".to_string());
+    }
+    None
+}
+
 fn settings_path() -> Result<PathBuf> {
     let app_data = std::env::var("APPDATA").context("APPDATA environment variable is not set")?;
     Ok(PathBuf::from(app_data).join("rayo").join("settings.json"))
 }
 
-fn load_settings() -> Result<GuiSettings> {
+fn load_settings() -> Result<(GuiSettings, Option<String>)> {
     let path = settings_path()?;
     if !path.exists() {
-        return Ok(GuiSettings::default());
+        return Ok((GuiSettings::default(), None));
     }
 
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("failed to read settings file {}", path.display()))?;
-    let mut settings: GuiSettings = serde_json::from_str(&raw)
-        .with_context(|| format!("invalid settings JSON at {}", path.display()))?;
+    let mut settings: GuiSettings = match serde_json::from_str(&raw) {
+        Ok(settings) => settings,
+        Err(_) => {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let backup = path.with_extension(format!("corrupt-{stamp}.json"));
+            let _ = fs::rename(&path, &backup);
+            return Ok((
+                GuiSettings::default(),
+                Some(format!(
+                    "Invalid settings were reset. Backup: {}",
+                    backup.display()
+                )),
+            ));
+        }
+    };
     sanitize_settings(&mut settings);
-    Ok(settings)
+    Ok((settings, None))
 }
 
 fn save_settings(settings: &GuiSettings) -> Result<()> {
@@ -403,6 +479,7 @@ fn run_search(
                     directories_only: settings.directories_only,
                     files_only: settings.files_only,
                     limit: settings.limit,
+                    prefer_trigram: false,
                 });
                 (
                     search_results
@@ -499,12 +576,20 @@ fn spawn_search_worker(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut initial_settings = load_settings().unwrap_or_else(|err| {
+    let mut startup_query = cli.query.clone();
+    let (mut initial_settings, startup_notice) = load_settings().unwrap_or_else(|err| {
         eprintln!("failed to load settings: {err:#}");
-        GuiSettings::default()
+        (GuiSettings::default(), None)
     });
     if let Some(under) = cli.under {
         initial_settings.under_dir = normalize_optional_text(under);
+    }
+    if let Some(open_path) = cli.open.as_ref() {
+        apply_open_context(
+            open_path,
+            &mut initial_settings.under_dir,
+            &mut startup_query,
+        );
     }
     if let Some(limit) = cli.limit {
         initial_settings.limit = limit;
@@ -549,6 +634,13 @@ fn main() -> Result<()> {
     ui.set_settings_directories_only(initial_settings.directories_only);
     ui.set_settings_limit(initial_settings.limit as i32);
     ui.set_settings_debounce_ms(initial_settings.debounce_ms as i32);
+    ui.set_settings_hint(settings_hint(&initial_settings).into());
+    if let Some(notice) = startup_notice {
+        ui.set_status_text(notice.into());
+    }
+    if let Some(query) = startup_query {
+        ui.set_query(query.into());
+    }
 
     {
         let preload_config = config.clone();
@@ -646,6 +738,7 @@ fn main() -> Result<()> {
                 ui.set_settings_directories_only(settings.directories_only);
                 ui.set_settings_limit(settings.limit as i32);
                 ui.set_settings_debounce_ms(settings.debounce_ms as i32);
+                ui.set_settings_error_text("".into());
                 ui.set_show_settings(true);
             }
         });
@@ -656,6 +749,23 @@ fn main() -> Result<()> {
         ui.on_cancel_settings(move || {
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_show_settings(false);
+                ui.set_settings_error_text("".into());
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_reset_settings(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let defaults = GuiSettings::default();
+                ui.set_settings_under_dir("".into());
+                ui.set_settings_extension("".into());
+                ui.set_settings_files_only(defaults.files_only);
+                ui.set_settings_directories_only(defaults.directories_only);
+                ui.set_settings_limit(defaults.limit as i32);
+                ui.set_settings_debounce_ms(defaults.debounce_ms as i32);
+                ui.set_settings_error_text("".into());
             }
         });
     }
@@ -676,6 +786,13 @@ fn main() -> Result<()> {
                     debounce_ms: debounce_ms.max(0) as u64,
                 };
                 sanitize_settings(&mut next);
+                if let Some(validation_error) = validate_settings(&next) {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_settings_error_text(validation_error.into());
+                        ui.set_status_text("Please fix settings before saving.".into());
+                    }
+                    return;
+                }
 
                 {
                     let mut guard = match settings_state.write() {
@@ -692,7 +809,9 @@ fn main() -> Result<()> {
                             .unwrap_or_else(|| "<none>".to_string())
                             .into(),
                     );
+                    ui.set_settings_hint(settings_hint(&next).into());
                     ui.set_show_settings(false);
+                    ui.set_settings_error_text("".into());
                     match save_settings(&next) {
                         Ok(_) => ui.set_status_text("Settings saved.".into()),
                         Err(err) => {
