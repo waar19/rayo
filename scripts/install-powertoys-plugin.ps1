@@ -1,7 +1,9 @@
 param(
-    [string]$PluginZipPath = "dist/powertoys-run/RayoPlugin.zip",
-    [switch]$AutoInstallDependencies,
-    [switch]$RestartPowerToys
+    [string]$PluginZipPath = "",
+    [bool]$AutoInstallDependencies = $true,
+    [bool]$RestartPowerToys = $true,
+    [string]$Repository = "waar19/rayo",
+    [string]$ReleaseTag = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,20 +18,77 @@ function Install-WithWinget {
     winget install --id $Id -e --accept-package-agreements --accept-source-agreements
 }
 
+function Get-PowerToysExePath {
+    $candidates = @(
+        (Join-Path $env:LOCALAPPDATA "PowerToys/PowerToys.exe"),
+        (Join-Path $env:ProgramFiles "PowerToys/PowerToys.exe")
+    )
+    $programFilesX86 = ${env:ProgramFiles(x86)}
+    if ($env:ProgramFiles -ne $programFilesX86 -and $programFilesX86) {
+        $candidates += (Join-Path $programFilesX86 "PowerToys/PowerToys.exe")
+    }
+    foreach ($candidate in $candidates) {
+        if ($candidate -and (Test-Path $candidate)) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Test-DotNetDesktopRuntime {
+    if (-not (Test-Command "dotnet")) {
+        return $false
+    }
+    $runtimeLines = dotnet --list-runtimes
+    return ($runtimeLines | Select-String "Microsoft.WindowsDesktop.App 9\.") -ne $null
+}
+
+function Resolve-PluginZipFromRelease {
+    param(
+        [string]$Repo,
+        [string]$Tag
+    )
+
+    $headers = @{ "User-Agent" = "rayo-powertoys-installer" }
+    if ([string]::IsNullOrWhiteSpace($Tag)) {
+        $url = "https://api.github.com/repos/$Repo/releases/latest"
+    } else {
+        $url = "https://api.github.com/repos/$Repo/releases/tags/$Tag"
+    }
+
+    Write-Host "Fetching release metadata from $url"
+    $release = Invoke-RestMethod -Uri $url -Headers $headers
+    $asset = $release.assets | Where-Object { $_.name -eq "RayoPlugin.zip" } | Select-Object -First 1
+    if ($null -eq $asset) {
+        throw "RayoPlugin.zip not found in release '$($release.tag_name)'."
+    }
+
+    $tmpDir = Join-Path $env:TEMP "rayo-plugin-install"
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+    $zipPath = Join-Path $tmpDir "RayoPlugin.zip"
+    Write-Host "Downloading plugin zip: $($asset.browser_download_url)"
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -Headers $headers
+    return $zipPath
+}
+
+$defaultLocalZip = Join-Path (Get-Location) "dist/powertoys-run/RayoPlugin.zip"
+if ([string]::IsNullOrWhiteSpace($PluginZipPath)) {
+    if (Test-Path $defaultLocalZip) {
+        $PluginZipPath = $defaultLocalZip
+        Write-Host "Using local plugin zip: $PluginZipPath"
+    } else {
+        $PluginZipPath = Resolve-PluginZipFromRelease -Repo $Repository -Tag $ReleaseTag
+    }
+}
+
 if (-not (Test-Path $PluginZipPath)) {
-    throw "Plugin zip not found: $PluginZipPath. Build/publish first or download CI artifact."
+    throw "Plugin zip not found: $PluginZipPath"
 }
 
 $pluginRoot = Join-Path $env:LOCALAPPDATA "Microsoft/PowerToys/PowerToys Run/Plugins/Rayo"
-$powerToysExe = Join-Path $env:LOCALAPPDATA "PowerToys/PowerToys.exe"
-
-$hasPowerToys = Test-Path $powerToysExe
-$hasDotnet = Test-Command "dotnet"
-$hasDesktopRuntime = $false
-if ($hasDotnet) {
-    $runtimeLines = dotnet --list-runtimes
-    $hasDesktopRuntime = ($runtimeLines | Select-String "Microsoft.WindowsDesktop.App 9\.") -ne $null
-}
+$powerToysExe = Get-PowerToysExePath
+$hasPowerToys = $null -ne $powerToysExe
+$hasDesktopRuntime = Test-DotNetDesktopRuntime
 
 if (-not $hasPowerToys) {
     Write-Warning "PowerToys not detected."
@@ -39,7 +98,8 @@ if (-not $hasPowerToys) {
         }
         Write-Host "Installing PowerToys..."
         Install-WithWinget -Id "Microsoft.PowerToys"
-        $hasPowerToys = Test-Path $powerToysExe
+        $powerToysExe = Get-PowerToysExePath
+        $hasPowerToys = $null -ne $powerToysExe
     }
 }
 
@@ -51,11 +111,16 @@ if (-not $hasDesktopRuntime) {
         }
         Write-Host "Installing .NET Desktop Runtime 9..."
         Install-WithWinget -Id "Microsoft.DotNet.DesktopRuntime.9"
+        $hasDesktopRuntime = Test-DotNetDesktopRuntime
     }
 }
 
 if (-not $hasPowerToys) {
     throw "PowerToys still not detected. Install it, then rerun installer."
+}
+
+if (-not $hasDesktopRuntime) {
+    throw ".NET Desktop Runtime 9 still not detected. Install it, then rerun installer."
 }
 
 if (Test-Path $pluginRoot) {
@@ -68,8 +133,8 @@ Write-Host "Rayo plugin installed at: $pluginRoot"
 
 if ($RestartPowerToys) {
     Get-Process -Name "PowerToys" -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Milliseconds 500
-    if (Test-Path $powerToysExe) {
+    Start-Sleep -Milliseconds 600
+    if ($powerToysExe -and (Test-Path $powerToysExe)) {
         Start-Process $powerToysExe | Out-Null
         Write-Host "PowerToys restarted."
     }

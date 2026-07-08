@@ -25,5 +25,11 @@ Manual installation (PowerToys Run):
 Automatic installer with dependency detection:
 
 ```powershell
+irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex
+```
+
+Local install with explicit zip:
+
+```powershell
 pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\RayoPlugin.zip -AutoInstallDependencies -RestartPowerToys
 ```

@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Build Windows bundle
+        shell: pwsh
+        run: .\scripts\release-windows.ps1
+
+      - name: Publish PowerToys plugin
+        run: dotnet publish .\integrations\powertoys-run\Community.PowerToys.Run.Plugin.Rayo.csproj -c Release -o .\dist\powertoys-run\RayoPlugin
+
+      - name: Package PowerToys plugin zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .\dist\powertoys-run -Force | Out-Null
+          Compress-Archive -Path .\dist\powertoys-run\RayoPlugin\* -DestinationPath .\dist\powertoys-run\RayoPlugin.zip -Force
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/rayo-windows.zip
+            dist/powertoys-run/RayoPlugin.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true

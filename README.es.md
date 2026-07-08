@@ -171,7 +171,13 @@ Luego reinicia PowerToys y busca con:
 
 ### Instalador con detección de dependencias
 
-Si quieres detección/instalación automática:
+Instalación en un comando desde último GitHub Release:
+
+```powershell
+irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex
+```
+
+Instalación local con zip explícito:
 
 ```powershell
 pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\RayoPlugin.zip -AutoInstallDependencies -RestartPowerToys
@@ -183,9 +189,12 @@ Qué hace:
 - Opcionalmente instala faltantes con `winget`.
 - Instala plugin en `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
 
-### Artifact en CI
+### Assets de release
 
-- CI publica artifact `rayo-powertoys-plugin` como `RayoPlugin.zip` para instalación/distribución.
+- Workflow por tag publica:
+  - `rayo-windows.zip`
+  - `RayoPlugin.zip`
+- Instalador descarga `RayoPlugin.zip` del último release automáticamente cuando no recibe `-PluginZipPath`.
 
 ## Licencia
 
