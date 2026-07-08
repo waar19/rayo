@@ -148,11 +148,30 @@ pwsh .\scripts\release-windows.ps1
 
 Esto genera `dist/rayo-windows.zip` con `rayo-cli.exe`, `rayo-service.exe`, `rayo-gui.exe` y documentación.
 
-## Scaffold de PowerToys Run
+## Plugin de PowerToys Run
 
-- Ubicación: [`integrations/powertoys-run`](integrations/powertoys-run)
-- Proyecto: `Community.PowerToys.Run.Plugin.Rayo`
-- Estado actual: cliente named pipe + DTOs compilados en CI; el siguiente paso es conectar interfaces reales de PowerToys.
+- Proyecto del plugin: [`integrations/powertoys-run`](integrations/powertoys-run)
+- Keyword de activación: `ry`
+- Dependencia en runtime: `rayo-service` corriendo como Administrador (`\\.\pipe\rayo-query`)
+
+### Build e instalación manual
+
+```powershell
+dotnet build .\integrations\powertoys-run\Community.PowerToys.Run.Plugin.Rayo.csproj -c Release
+dotnet publish .\integrations\powertoys-run\Community.PowerToys.Run.Plugin.Rayo.csproj -c Release -o .\dist\powertoys-run\RayoPlugin
+```
+
+Copia salida del plugin a:
+
+`%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`
+
+Luego reinicia PowerToys y busca con:
+
+`ry <consulta>`
+
+### Artifact en CI
+
+- CI publica artifact `rayo-powertoys-plugin` como `RayoPlugin.zip` para instalación/distribución.
 
 ## Licencia
 
