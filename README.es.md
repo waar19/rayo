@@ -186,6 +186,8 @@ pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\
 Qué hace:
 - Detecta PowerToys.
 - Instala plugin en `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
+- Instala `rayo-service.exe` y `rayo-cli.exe` en `%LOCALAPPDATA%\Rayo\` para que Enter pueda iniciar el servicio desde PowerToys.
+- Soporta `RAYO_SERVICE_PATH` como override para ubicación personalizada del servicio.
 
 ### Assets de release
 
@@ -198,7 +200,7 @@ Qué hace:
 
 Si PowerToys muestra error al iniciar plugin Rayo:
 
-1. Verifica que usas último release (`v0.1.3` o superior).
+1. Verifica que usas último release (`v0.1.4` o superior).
 2. Reinstala plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex

@@ -9,15 +9,19 @@ namespace Community.PowerToys.Run.Plugin.Rayo;
 public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 {
     public static string PluginID => "F8074EA2F6CF4A3A8D996BBA5F95F185";
+    private const string ServiceExecutableName = "rayo-service.exe";
+    private const string ServicePathEnvironmentVariable = "RAYO_SERVICE_PATH";
 
     public string Name => "Rayo";
 
     public string Description => "Fast file search powered by Rayo service.";
 
     private readonly RayoPipeClient _pipeClient = new();
+    private PluginInitContext? _pluginContext;
 
     public void Init(PluginInitContext context)
     {
+        _pluginContext = context;
     }
 
     public List<Result> Query(Query query)
@@ -200,23 +204,100 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         }
     }
 
-    private static bool TryStartService()
+    private bool TryStartService()
     {
+        var servicePath = ResolveServicePath();
+        if (servicePath is null)
+        {
+            ShowStatus("rayo-service.exe not found. Install Rayo or set RAYO_SERVICE_PATH.");
+            return false;
+        }
+
         try
         {
             Process.Start(
                 new ProcessStartInfo
                 {
-                    FileName = "rayo-service.exe",
+                    FileName = servicePath,
                     UseShellExecute = true,
                     Verb = "runas",
                 }
             );
+            ShowStatus("Starting rayo-service as administrator. Retry search in a few seconds.");
             return false;
         }
         catch
         {
+            ShowStatus("Could not start rayo-service. Confirm UAC and try again.");
             return false;
         }
+    }
+
+    private string? ResolveServicePath()
+    {
+        var configuredPath = Environment.GetEnvironmentVariable(ServicePathEnvironmentVariable);
+        var configuredCandidate = NormalizePathCandidate(configuredPath);
+        if (configuredCandidate is not null && File.Exists(configuredCandidate))
+        {
+            return configuredCandidate;
+        }
+
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrWhiteSpace(localAppData))
+        {
+            var defaultPath = Path.Combine(localAppData, "Rayo", ServiceExecutableName);
+            if (File.Exists(defaultPath))
+            {
+                return defaultPath;
+            }
+        }
+
+        var pathValue = Environment.GetEnvironmentVariable("PATH");
+        if (string.IsNullOrWhiteSpace(pathValue))
+        {
+            return null;
+        }
+
+        var pathEntries = pathValue.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var entry in pathEntries)
+        {
+            var normalizedEntry = NormalizePathCandidate(entry);
+            if (normalizedEntry is null)
+            {
+                continue;
+            }
+
+            var candidate = Path.Combine(normalizedEntry, ServiceExecutableName);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private void ShowStatus(string message)
+    {
+        try
+        {
+            _pluginContext?.API?.ShowMsg(Name, message);
+        }
+        catch
+        {
+            // Ignore UI notification errors to avoid blocking actions.
+        }
+    }
+
+    private static string? NormalizePathCandidate(string? rawPath)
+    {
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            return null;
+        }
+
+        var expanded = Environment.ExpandEnvironmentVariables(rawPath.Trim());
+        var withoutQuotes = expanded.Trim('"');
+        return string.IsNullOrWhiteSpace(withoutQuotes) ? null : withoutQuotes;
     }
 }

@@ -1,5 +1,6 @@
 param(
     [string]$PluginZipPath = "",
+    [string]$WindowsBundleZipPath = "",
     [bool]$AutoInstallDependencies = $true,
     [bool]$RestartPowerToys = $true,
     [string]$Repository = "waar19/rayo",
@@ -49,7 +50,7 @@ function Stop-PowerToysIfRunning {
     return $true
 }
 
-function Resolve-PluginZipFromRelease {
+function Get-ReleaseMetadata {
     param(
         [string]$Repo,
         [string]$Tag
@@ -64,26 +65,40 @@ function Resolve-PluginZipFromRelease {
 
     Write-Host "Fetching release metadata from $url"
     $release = Invoke-RestMethod -Uri $url -Headers $headers
-    $asset = $release.assets | Where-Object { $_.name -eq "RayoPlugin.zip" } | Select-Object -First 1
+    return $release
+}
+
+function Download-ReleaseAsset {
+    param(
+        $Release,
+        [string]$AssetName
+    )
+
+    $asset = $Release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if ($null -eq $asset) {
-        throw "RayoPlugin.zip not found in release '$($release.tag_name)'."
+        throw "$AssetName not found in release '$($Release.tag_name)'."
     }
 
+    $headers = @{ "User-Agent" = "rayo-powertoys-installer" }
     $tmpDir = Join-Path $env:TEMP "rayo-plugin-install"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-    $zipPath = Join-Path $tmpDir "RayoPlugin.zip"
-    Write-Host "Downloading plugin zip: $($asset.browser_download_url)"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -Headers $headers
-    return $zipPath
+    $assetPath = Join-Path $tmpDir $AssetName
+    Write-Host "Downloading $AssetName: $($asset.browser_download_url)"
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $assetPath -Headers $headers
+    return $assetPath
 }
 
 $defaultLocalZip = Join-Path (Get-Location) "dist/powertoys-run/RayoPlugin.zip"
+$defaultWindowsBundleZip = Join-Path (Get-Location) "dist/rayo-windows.zip"
+$release = $null
+
 if ([string]::IsNullOrWhiteSpace($PluginZipPath)) {
     if (Test-Path $defaultLocalZip) {
         $PluginZipPath = $defaultLocalZip
         Write-Host "Using local plugin zip: $PluginZipPath"
     } else {
-        $PluginZipPath = Resolve-PluginZipFromRelease -Repo $Repository -Tag $ReleaseTag
+        $release = Get-ReleaseMetadata -Repo $Repository -Tag $ReleaseTag
+        $PluginZipPath = Download-ReleaseAsset -Release $release -AssetName "RayoPlugin.zip"
     }
 }
 
@@ -91,7 +106,24 @@ if (-not (Test-Path $PluginZipPath)) {
     throw "Plugin zip not found: $PluginZipPath"
 }
 
+if ([string]::IsNullOrWhiteSpace($WindowsBundleZipPath)) {
+    if (Test-Path $defaultWindowsBundleZip) {
+        $WindowsBundleZipPath = $defaultWindowsBundleZip
+        Write-Host "Using local Windows bundle zip: $WindowsBundleZipPath"
+    } else {
+        if ($null -eq $release) {
+            $release = Get-ReleaseMetadata -Repo $Repository -Tag $ReleaseTag
+        }
+        $WindowsBundleZipPath = Download-ReleaseAsset -Release $release -AssetName "rayo-windows.zip"
+    }
+}
+
+if (-not (Test-Path $WindowsBundleZipPath)) {
+    throw "Windows bundle zip not found: $WindowsBundleZipPath"
+}
+
 $pluginRoot = Join-Path $env:LOCALAPPDATA "Microsoft/PowerToys/PowerToys Run/Plugins/Rayo"
+$serviceRoot = Join-Path $env:LOCALAPPDATA "Rayo"
 $powerToysExe = Get-PowerToysExePath
 $hasPowerToys = $null -ne $powerToysExe
 
@@ -126,6 +158,28 @@ Expand-Archive -Path $PluginZipPath -DestinationPath $pluginRoot -Force
 
 Write-Host "Rayo plugin installed at: $pluginRoot"
 
+$serviceTempDir = Join-Path $env:TEMP "rayo-service-install"
+if (Test-Path $serviceTempDir) {
+    Remove-Item -Recurse -Force $serviceTempDir
+}
+New-Item -ItemType Directory -Path $serviceTempDir -Force | Out-Null
+Expand-Archive -Path $WindowsBundleZipPath -DestinationPath $serviceTempDir -Force
+
+$serviceSource = Join-Path $serviceTempDir "rayo-service.exe"
+$cliSource = Join-Path $serviceTempDir "rayo-cli.exe"
+if (-not (Test-Path $serviceSource)) {
+    throw "rayo-service.exe not found in bundle: $WindowsBundleZipPath"
+}
+if (-not (Test-Path $cliSource)) {
+    throw "rayo-cli.exe not found in bundle: $WindowsBundleZipPath"
+}
+
+New-Item -ItemType Directory -Path $serviceRoot -Force | Out-Null
+Copy-Item $serviceSource -Destination (Join-Path $serviceRoot "rayo-service.exe") -Force
+Copy-Item $cliSource -Destination (Join-Path $serviceRoot "rayo-cli.exe") -Force
+Remove-Item -Recurse -Force $serviceTempDir
+Write-Host "Rayo binaries installed at: $serviceRoot"
+
 if ($RestartPowerToys) {
     if ($powerToysExe -and (Test-Path $powerToysExe)) {
         Start-Process $powerToysExe | Out-Null
@@ -138,3 +192,4 @@ if ($RestartPowerToys) {
 }
 
 Write-Host "Done. Open PowerToys Run and use: ry <query>"
+Write-Host "If needed, set RAYO_SERVICE_PATH to override service binary location."
