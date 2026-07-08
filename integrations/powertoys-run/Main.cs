@@ -1,0 +1,222 @@
+using System.Diagnostics;
+using System.IO;
+using System.Windows;
+using System.Windows.Input;
+using Wox.Plugin;
+
+namespace Community.PowerToys.Run.Plugin.Rayo;
+
+public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
+{
+    public static string PluginID => "F8074EA2F6CF4A3A8D996BBA5F95F185";
+
+    public string Name => "Rayo";
+
+    public string Description => "Fast file search powered by Rayo service.";
+
+    private readonly RayoPipeClient _pipeClient = new();
+
+    public void Init(PluginInitContext context)
+    {
+    }
+
+    public List<Result> Query(Query query)
+    {
+        return Query(query, delayedExecution: false);
+    }
+
+    public List<Result> Query(Query query, bool delayedExecution)
+    {
+        var input = query?.Search?.Trim() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return [];
+        }
+
+        try
+        {
+            var response = _pipeClient
+                .QueryAsync(input, limit: 20)
+                .GetAwaiter()
+                .GetResult();
+            if (response?.Results is null || response.Results.Count == 0)
+            {
+                return [];
+            }
+
+            var mapped = new List<Result>(response.Results.Count);
+            for (var idx = 0; idx < response.Results.Count; idx++)
+            {
+                var item = response.Results[idx];
+                var title = Path.GetFileName(item.Path);
+                if (string.IsNullOrWhiteSpace(title))
+                {
+                    title = item.Path;
+                }
+
+                mapped.Add(new Result
+                {
+                    Title = title,
+                    SubTitle = item.Path,
+                    Score = 10_000 - idx,
+                    IcoPath = item.IsDirectory ? "Images\\rayo.folder.png" : "Images\\rayo.file.png",
+                    ContextData = item,
+                    Action = action =>
+                    {
+                        if (action?.SpecialKeyState?.CtrlPressed == true)
+                        {
+                            return OpenContainingFolder(item.Path);
+                        }
+                        return OpenItem(item.Path, asAdmin: false);
+                    },
+                });
+            }
+
+            return mapped;
+        }
+        catch (Exception)
+        {
+            return
+            [
+                new Result
+                {
+                    Title = "Rayo service not running",
+                    SubTitle = "Press Enter to start rayo-service as administrator.",
+                    Score = int.MaxValue,
+                    IcoPath = "Images\\rayo.warn.png",
+                    Action = _ => TryStartService(),
+                },
+            ];
+        }
+    }
+
+    public List<ContextMenuResult> LoadContextMenus(Result selectedResult)
+    {
+        if (selectedResult?.ContextData is not QueryResultItem item)
+        {
+            return [];
+        }
+
+        return
+        [
+            new ContextMenuResult
+            {
+                PluginName = Name,
+                Title = "Open as administrator",
+                Glyph = "\uE7EF",
+                FontFamily = "Segoe Fluent Icons",
+                AcceleratorKey = Key.Enter,
+                AcceleratorModifiers = ModifierKeys.Control | ModifierKeys.Shift,
+                Action = _ => OpenItem(item.Path, asAdmin: true),
+            },
+            new ContextMenuResult
+            {
+                PluginName = Name,
+                Title = "Open containing folder",
+                Glyph = "\uE838",
+                FontFamily = "Segoe Fluent Icons",
+                AcceleratorKey = Key.E,
+                AcceleratorModifiers = ModifierKeys.Control | ModifierKeys.Shift,
+                Action = _ => OpenContainingFolder(item.Path),
+            },
+            new ContextMenuResult
+            {
+                PluginName = Name,
+                Title = "Copy path",
+                Glyph = "\uE8C8",
+                FontFamily = "Segoe Fluent Icons",
+                AcceleratorKey = Key.C,
+                AcceleratorModifiers = ModifierKeys.Control | ModifierKeys.Shift,
+                Action = _ => CopyPath(item.Path),
+            },
+        ];
+    }
+
+    private static bool OpenItem(string path, bool asAdmin)
+    {
+        try
+        {
+            var start = new ProcessStartInfo
+            {
+                FileName = path,
+                UseShellExecute = true,
+            };
+            if (asAdmin)
+            {
+                start.Verb = "runas";
+            }
+
+            Process.Start(start);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool OpenContainingFolder(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Process.Start(
+                    new ProcessStartInfo
+                    {
+                        FileName = path,
+                        UseShellExecute = true,
+                    }
+                );
+                return true;
+            }
+
+            Process.Start(
+                new ProcessStartInfo
+                {
+                    FileName = "explorer.exe",
+                    Arguments = $"/select,\"{path}\"",
+                    UseShellExecute = true,
+                }
+            );
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool CopyPath(string path)
+    {
+        try
+        {
+            Clipboard.SetText(path);
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryStartService()
+    {
+        try
+        {
+            Process.Start(
+                new ProcessStartInfo
+                {
+                    FileName = "rayo-service.exe",
+                    UseShellExecute = true,
+                    Verb = "runas",
+                }
+            );
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}
