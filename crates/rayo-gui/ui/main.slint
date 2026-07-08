@@ -1,0 +1,175 @@
+import { Button, LineEdit, VerticalBox, HorizontalBox, ScrollView } from "std-widgets.slint";
+
+export struct ResultRow {
+    kind: string,
+    name: string,
+    path: string,
+}
+
+export component MainWindow inherits Window {
+    title: "Rayo";
+    width: 1040px;
+    height: 700px;
+    background: #111317;
+
+    in-out property <string> query: "";
+    in-out property <string> status-text: "Ready.";
+    in-out property <string> mode-text: "service: disconnected";
+    in-out property <string> under-text: "<none>";
+    in-out property <int> selected-index: -1;
+    in-out property <[ResultRow]> results: [];
+
+    callback query-edited(string);
+    callback search-now();
+    callback select-row(int);
+    callback activate-row(int);
+    callback open-selected();
+    callback open-selected-admin();
+    callback open-folder-selected();
+    callback copy-path-selected();
+
+    VerticalBox {
+        spacing: 10px;
+        padding: 12px;
+
+        Rectangle {
+            border-color: #2a2f36;
+            border-width: 1px;
+            border-radius: 8px;
+            background: #171a21;
+            height: 74px;
+
+            VerticalBox {
+                spacing: 8px;
+                padding: 10px;
+
+                HorizontalBox {
+                    spacing: 8px;
+
+                    Text {
+                        text: "Rayo";
+                        color: #d7e0f0;
+                        font-size: 18px;
+                        font-weight: 600;
+                    }
+
+                    Text {
+                        text: root.mode-text;
+                        color: #8fa4bf;
+                        vertical-alignment: center;
+                    }
+                }
+
+                HorizontalBox {
+                    spacing: 8px;
+                    search-input := LineEdit {
+                        text <=> root.query;
+                        placeholder-text: "Type to search (minimum 2 chars)";
+                        edited => {
+                            root.query-edited(self.text);
+                        }
+                    }
+                    Button {
+                        text: "Search";
+                        clicked => { root.search-now(); }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            border-color: #2a2f36;
+            border-width: 1px;
+            border-radius: 8px;
+            background: #111317;
+            clip: true;
+
+            ScrollView {
+                VerticalBox {
+                    spacing: 0px;
+
+                    for row[idx] in root.results: Rectangle {
+                        height: 48px;
+                        background: row-touch.has-hover ? #1d2430 : (root.selected-index == idx ? #25374f : #111317);
+
+                        HorizontalBox {
+                            padding: 8px;
+                            spacing: 10px;
+
+                            Text {
+                                text: row.kind;
+                                color: #8fa4bf;
+                                width: 46px;
+                                vertical-alignment: center;
+                                horizontal-alignment: center;
+                            }
+
+                            VerticalBox {
+                                spacing: 2px;
+                                Text {
+                                    text: row.name;
+                                    color: #d7e0f0;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: row.path;
+                                    color: #8fa4bf;
+                                    font-size: 12px;
+                                }
+                            }
+                        }
+
+                        row-touch := TouchArea {
+                            clicked => {
+                                root.select-row(idx);
+                            }
+                            double-clicked => {
+                                root.activate-row(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            border-color: #2a2f36;
+            border-width: 1px;
+            border-radius: 8px;
+            background: #171a21;
+            height: 84px;
+
+            VerticalBox {
+                spacing: 8px;
+                padding: 10px;
+
+                HorizontalBox {
+                    spacing: 8px;
+                    Button {
+                        text: "Open";
+                        clicked => { root.open-selected(); }
+                    }
+                    Button {
+                        text: "Open as admin";
+                        clicked => { root.open-selected-admin(); }
+                    }
+                    Button {
+                        text: "Open folder";
+                        clicked => { root.open-folder-selected(); }
+                    }
+                    Button {
+                        text: "Copy path";
+                        clicked => { root.copy-path-selected(); }
+                    }
+                }
+
+                Text {
+                    text: root.status-text + " | under=" + root.under-text;
+                    color: #8fa4bf;
+                    font-size: 12px;
+                }
+            }
+        }
+    }
+}

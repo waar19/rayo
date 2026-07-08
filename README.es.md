@@ -23,7 +23,7 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 - `crates/rayo-core`: indexado, búsqueda, integración NTFS/USN, persistencia.
 - `crates/rayo-cli`: interfaz CLI (`index`, `search`, `watch`).
 - `crates/rayo-service`: servicio de fondo elevado con índice en memoria y API por named pipe.
-- `crates/rayo-gui`: GUI nativa (`egui`) con búsqueda por servicio o fallback local.
+- `crates/rayo-gui`: GUI nativa (`Slint`, estilo Fluent) con búsqueda por servicio o fallback local.
 
 ## Requisitos
 
@@ -56,11 +56,11 @@ cargo run -p rayo-gui -- --index .\c.rayo
 cargo run -p rayo-cli -- shell install --gui-path .\target\debug\rayo-gui.exe
 ```
 
-### Atajos de GUI
+### Acciones de GUI
 
-- `Enter`: abre resultado seleccionado.
-- `Ctrl+Enter`: abre resultado como Administrador (UAC).
-- Menú contextual por fila: abrir, abrir como admin, abrir carpeta contenedora, copiar ruta.
+- Selecciona una fila y usa botones: `Open`, `Open as admin`, `Open folder`, `Copy path`.
+- Búsqueda con debounce (~80 ms por defecto) para no congelar mientras escribes.
+- Consultas vacías o de 1 caracter no disparan búsqueda completa salvo que uses `--under`.
 
 ## Resultados de validación (Windows 11, C:, Jul 2026)
 
@@ -94,7 +94,7 @@ Validación de servicio + integración:
 
 ### Fase 3
 
-- GUI nativa (`egui` o `Slint`).
+- Seguir puliendo la GUI Fluent nativa (menú contextual, atajos de teclado, acciones shell).
 - Arquitectura orientada a servicio:
   - servicio de fondo para índice/watch,
   - IPC para clientes de consulta (named pipes),

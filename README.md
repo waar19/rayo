@@ -23,7 +23,7 @@ English | [Español](README.es.md)
 - `crates/rayo-core`: indexing, search, NTFS/USN integration, persistence.
 - `crates/rayo-cli`: CLI interface (`index`, `search`, `watch`).
 - `crates/rayo-service`: elevated background service with live in-memory index and named pipe API.
-- `crates/rayo-gui`: native desktop GUI (`egui`) with service/fallback search modes.
+- `crates/rayo-gui`: native desktop GUI (`Slint`, Fluent style) with service/fallback search modes.
 
 ## Requirements
 
@@ -56,11 +56,11 @@ cargo run -p rayo-gui -- --index .\c.rayo
 cargo run -p rayo-cli -- shell install --gui-path .\target\debug\rayo-gui.exe
 ```
 
-### GUI shortcuts
+### GUI actions
 
-- `Enter`: open selected result.
-- `Ctrl+Enter`: open selected result as Administrator (UAC prompt).
-- Context menu on each row: open, open as admin, open containing folder, copy path.
+- Select a row, then use action buttons: `Open`, `Open as admin`, `Open folder`, `Copy path`.
+- Debounced search (~80 ms by default) to keep typing smooth.
+- Empty or 1-character queries do not run full search unless `--under` is set.
 
 ## Validation results (Windows 11, C:, Jul 2026)
 
@@ -94,7 +94,7 @@ Service + integration validation:
 
 ### Phase 3
 
-- Native GUI (`egui` or `Slint`).
+- Keep polishing the native Fluent GUI (context menu, keyboard shortcuts, shell actions).
 - Service-first architecture:
   - background index/watch service,
   - IPC for query clients (named pipes),
