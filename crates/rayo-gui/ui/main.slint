@@ -37,42 +37,41 @@ export component MainWindow inherits Window {
             border-width: 1px;
             border-radius: 8px;
             background: #171a21;
-            height: 74px;
 
-            VerticalBox {
-                spacing: 8px;
+            HorizontalBox {
                 padding: 10px;
+                spacing: 8px;
 
-                HorizontalBox {
-                    spacing: 8px;
+                Text {
+                    text: "Rayo";
+                    color: #d7e0f0;
+                    font-size: 20px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
+                }
 
-                    Text {
-                        text: "Rayo";
-                        color: #d7e0f0;
-                        font-size: 18px;
-                        font-weight: 600;
-                    }
-
-                    Text {
-                        text: root.mode-text;
-                        color: #8fa4bf;
-                        vertical-alignment: center;
+                search-input := LineEdit {
+                    text <=> root.query;
+                    placeholder-text: "Search files and folders";
+                    font-size: 15px;
+                    height: 36px;
+                    edited => {
+                        root.query-edited(self.text);
                     }
                 }
 
-                HorizontalBox {
-                    spacing: 8px;
-                    search-input := LineEdit {
-                        text <=> root.query;
-                        placeholder-text: "Type to search (minimum 2 chars)";
-                        edited => {
-                            root.query-edited(self.text);
-                        }
-                    }
-                    Button {
-                        text: "Search";
-                        clicked => { root.search-now(); }
-                    }
+                Button {
+                    text: "Search";
+                    horizontal-stretch: 0;
+                    clicked => { root.search-now(); }
+                }
+
+                Text {
+                    text: root.mode-text;
+                    color: #8fa4bf;
+                    vertical-alignment: center;
+                    horizontal-stretch: 0;
                 }
             }
         }
@@ -83,14 +82,25 @@ export component MainWindow inherits Window {
             border-radius: 8px;
             background: #111317;
             clip: true;
+            vertical-stretch: 1;
 
-            ScrollView {
+            if root.results.length == 0 : Rectangle {
+                background: #111317;
+                Text {
+                    text: root.status-text;
+                    color: #8fa4bf;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            if root.results.length > 0 : ScrollView {
                 VerticalBox {
                     spacing: 0px;
 
                     for row[idx] in root.results: Rectangle {
                         height: 48px;
-                        background: row-touch.has-hover ? #1d2430 : (root.selected-index == idx ? #25374f : #111317);
+                        background: row-touch.has-hover ? #232a35 : (root.selected-index == idx ? #2d4260 : #111317);
 
                         HorizontalBox {
                             padding: 8px;
@@ -116,6 +126,7 @@ export component MainWindow inherits Window {
                                     text: row.path;
                                     color: #8fa4bf;
                                     font-size: 12px;
+                                    overflow: elide;
                                 }
                             }
                         }
@@ -138,36 +149,42 @@ export component MainWindow inherits Window {
             border-width: 1px;
             border-radius: 8px;
             background: #171a21;
-            height: 84px;
 
-            VerticalBox {
-                spacing: 8px;
+            HorizontalBox {
                 padding: 10px;
+                spacing: 8px;
 
-                HorizontalBox {
-                    spacing: 8px;
-                    Button {
-                        text: "Open";
-                        clicked => { root.open-selected(); }
-                    }
-                    Button {
-                        text: "Open as admin";
-                        clicked => { root.open-selected-admin(); }
-                    }
-                    Button {
-                        text: "Open folder";
-                        clicked => { root.open-folder-selected(); }
-                    }
-                    Button {
-                        text: "Copy path";
-                        clicked => { root.copy-path-selected(); }
-                    }
+                Button {
+                    text: "Open";
+                    enabled: root.selected-index >= 0;
+                    horizontal-stretch: 0;
+                    clicked => { root.open-selected(); }
+                }
+                Button {
+                    text: "Open as admin";
+                    enabled: root.selected-index >= 0;
+                    horizontal-stretch: 0;
+                    clicked => { root.open-selected-admin(); }
+                }
+                Button {
+                    text: "Open folder";
+                    enabled: root.selected-index >= 0;
+                    horizontal-stretch: 0;
+                    clicked => { root.open-folder-selected(); }
+                }
+                Button {
+                    text: "Copy path";
+                    enabled: root.selected-index >= 0;
+                    horizontal-stretch: 0;
+                    clicked => { root.copy-path-selected(); }
                 }
 
                 Text {
                     text: root.status-text + " | under=" + root.under-text;
                     color: #8fa4bf;
                     font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
                 }
             }
         }
