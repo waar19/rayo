@@ -23,6 +23,8 @@ public sealed class RayoPipeClient
     public async Task<QueryResponse?> QueryAsync(
         string query,
         int limit = 20,
+        string? mode = null,
+        int? timeoutMs = null,
         CancellationToken cancellationToken = default
     )
     {
@@ -41,8 +43,11 @@ public sealed class RayoPipeClient
         {
             Query = query,
             Limit = limit,
+            Mode = mode,
+            TimeoutMs = timeoutMs,
             DirectoriesOnly = false,
             FilesOnly = false,
+            Fuzzy = false,
         };
 
         var json = JsonSerializer.Serialize(request, JsonOptions);
@@ -72,7 +77,13 @@ public sealed class RayoPipeClient
 
         public bool FilesOnly { get; set; }
 
+        public bool Fuzzy { get; set; }
+
         public int? Limit { get; set; }
+
+        public string? Mode { get; set; }
+
+        public int? TimeoutMs { get; set; }
     }
 }
 
@@ -94,4 +105,8 @@ public sealed class QueryResultItem
     public string Path { get; set; } = string.Empty;
 
     public bool IsDirectory { get; set; }
+
+    public ulong? LineNumber { get; set; }
+
+    public string? LineText { get; set; }
 }

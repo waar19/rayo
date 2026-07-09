@@ -9,12 +9,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
-use grep_regex::RegexMatcherBuilder;
-use grep_searcher::SearcherBuilder;
-use grep_searcher::sinks::UTF8;
-use ignore::WalkBuilder;
 use rayo_core::{
-    FileIndex, SearchOptions, is_running_as_admin, load_index, normalize_drive, save_index,
+    ContentSearchOptions, FileIndex, SearchOptions, is_running_as_admin, load_index,
+    normalize_drive, save_index, search_content,
 };
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
@@ -55,6 +52,8 @@ enum Commands {
         limit: usize,
         #[arg(long, default_value_t = false)]
         trigram: bool,
+        #[arg(long, default_value_t = false)]
+        fuzzy: bool,
     },
     /// Search inside file contents (regex)
     Content {
@@ -106,7 +105,7 @@ enum ServiceAction {
     Install {
         #[arg(long)]
         service_exe: Option<PathBuf>,
-        #[arg(long, default_value = "C")]
+        #[arg(long, default_value = "auto")]
         drives: String,
         #[arg(long)]
         index: Option<PathBuf>,
@@ -131,8 +130,9 @@ fn main() -> Result<()> {
             files_only,
             limit,
             trigram,
+            fuzzy,
         } => run_search(
-            index, query, ext, under, glob, dirs_only, files_only, limit, trigram,
+            index, query, ext, under, glob, dirs_only, files_only, limit, trigram, fuzzy,
         ),
         Commands::Content {
             query,
@@ -194,6 +194,7 @@ fn run_search(
     files_only: bool,
     limit: usize,
     trigram: bool,
+    fuzzy: bool,
 ) -> Result<()> {
     let mut index = load_index(&index_path)?;
     index.set_trigram_enabled(trigram);
@@ -207,6 +208,7 @@ fn run_search(
         files_only,
         limit,
         prefer_trigram: trigram,
+        fuzzy,
     });
 
     for result in &results {
@@ -223,77 +225,23 @@ fn run_content_search(
     ext: Option<String>,
     limit: usize,
 ) -> Result<()> {
-    if !under.exists() {
-        return Err(anyhow!("under path does not exist: {}", under.display()));
-    }
+    let outcome = search_content(&ContentSearchOptions {
+        query,
+        under_dir: Some(under),
+        extension: ext,
+        limit,
+        timeout: Duration::from_secs(3),
+    })?;
 
-    let matcher = RegexMatcherBuilder::new()
-        .case_insensitive(true)
-        .build(&query)
-        .map_err(|err| anyhow!("invalid regex query: {err}"))?;
-    let mut searcher = SearcherBuilder::new().line_number(true).build();
-    let mut outputs = Vec::new();
-    let started = Instant::now();
-    let ext_filter = ext.map(|value| value.trim_start_matches('.').to_ascii_lowercase());
-
-    let walker = WalkBuilder::new(&under).standard_filters(true).build();
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        if let Some(required_ext) = &ext_filter {
-            let file_ext = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .map(|value| value.to_ascii_lowercase());
-            if file_ext.as_deref() != Some(required_ext.as_str()) {
-                continue;
-            }
-        }
-        if outputs.len() >= limit {
-            break;
-        }
-
-        let display_path = path.display().to_string();
-        if let Err(err) = searcher.search_path(
-            &matcher,
-            path,
-            UTF8(|line_number, line| {
-                if outputs.len() >= limit {
-                    return Ok(false);
-                }
-                outputs.push(format!(
-                    "{}:{}:{}",
-                    display_path,
-                    line_number,
-                    line.trim_end()
-                ));
-                Ok(true)
-            }),
-        ) {
-            let err_text = err.to_string();
-            if err_text.contains("invalid utf-8 sequence") {
-                continue;
-            }
-            return Err(anyhow!(
-                "content search failed on {}: {err}",
-                path.display()
-            ));
-        }
-    }
-
-    for line in &outputs {
-        println!("{line}");
+    for item in &outcome.matches {
+        println!("{}:{}:{}", item.path, item.line_number, item.line_text);
     }
     println!(
-        "Content results: {} in {:?}",
-        outputs.len(),
-        started.elapsed()
+        "Content results: {} in {:?} (scanned={} timed_out={})",
+        outcome.matches.len(),
+        outcome.took,
+        outcome.scanned_files,
+        outcome.timed_out
     );
     Ok(())
 }

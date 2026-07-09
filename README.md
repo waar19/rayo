@@ -22,8 +22,8 @@ English | [Español](README.es.md)
 
 - `crates/rayo-core`: indexing, search, NTFS/USN integration, persistence.
 - `crates/rayo-cli`: CLI interface (`index`, `search`, `content`, `watch`).
-- `crates/rayo-service`: elevated background service with live in-memory index and named pipe API.
-- `crates/rayo-gui`: native desktop GUI (`Slint`, Fluent style) with service/fallback search modes.
+- `crates/rayo-service`: elevated background service with live in-memory index, content search, and named pipe API.
+- `crates/rayo-gui`: native desktop GUI (`Slint`, Fluent style) with service/fallback search, content mode, fuzzy mode, hotkey, and preview panel.
 
 ## Requirements
 
@@ -45,6 +45,8 @@ cargo run -p rayo-cli -- index --drive C,D --output .\c.rayo
 
 # Search
 cargo run -p rayo-cli -- search --index .\c.rayo --query report --ext pdf
+# Fuzzy ranking
+cargo run -p rayo-cli -- search --index .\c.rayo --query rpt --fuzzy
 
 # Content search (regex, ripgrep-style)
 cargo run -p rayo-cli -- content --query "Rayo GUI search client" --under . --limit 20
@@ -53,8 +55,8 @@ cargo run -p rayo-cli -- content --query "Rayo GUI search client" --under . --li
 cargo run -p rayo-cli -- watch --drive C --index .\c.rayo
 
 # Start background service (run terminal as Administrator)
-# Single drive:
-cargo run -p rayo-service -- --drive C --index .\c.rayo
+# Auto-detect fixed NTFS drives:
+cargo run -p rayo-service -- --drives auto --index .\index.rayo
 # Multi-drive merge:
 cargo run -p rayo-service -- --drives C,D --index .\c.rayo
 
@@ -71,9 +73,11 @@ cargo run -p rayo-cli -- shell doctor --gui-path .\target\debug\rayo-gui.exe
 ### GUI actions
 
 - Select a row, then use action buttons: `Open`, `Open as admin`, `Open folder`, `Copy path`.
-- Built-in Settings panel lets you tune scope, extension, mode, result limit, and debounce.
+- Built-in Settings panel lets you tune scope, extension, name/content mode, fuzzy mode, result limit, and debounce.
 - Keyboard shortcuts: `Ctrl+,` opens Settings and `Esc` closes Settings.
+- Global hotkey: `Ctrl+Alt+Space` focuses Rayo window.
 - Empty or 1-character queries do not run full search unless `--under` is set.
+- Right-click on result row opens contextual action menu.
 
 ### Contextual GUI launch flags
 
@@ -151,7 +155,7 @@ This generates `dist/rayo-windows.zip` with `rayo-cli.exe`, `rayo-service.exe`, 
 ## PowerToys Run plugin
 
 - Plugin project: [`integrations/powertoys-run`](integrations/powertoys-run)
-- Action keyword: `ry`
+- Action keyword: `ry` (global mode also available in PowerToys settings)
 - Runtime dependency: `rayo-service` running as Administrator (`\\.\pipe\rayo-query`)
 
 ### Build and install manually
@@ -168,6 +172,10 @@ Copy plugin output to:
 Then restart PowerToys and search with:
 
 `ry <query>`
+
+Content mode from plugin:
+
+`ry c <regex>`
 
 ### Run as background service (recommended)
 
@@ -210,7 +218,7 @@ What it does:
 
 - Service log (live): `%ProgramData%\Rayo\service.log`
 - PowerToys plugin shows startup/indexing progress while service warms up.
-- GUI status bar shows source and indexed entries (for example: `service | indexed=...`).
+- GUI status bar shows source, indexed entries, request count, and average latency.
 
 ```powershell
 Get-Content C:\ProgramData\Rayo\service.log -Tail 20 -Wait
@@ -236,13 +244,20 @@ pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
 - Tag-based release workflow publishes:
   - `rayo-windows.zip`
   - `RayoPlugin.zip`
+  - `rayo-winget-manifest-<version>.zip`
 - Installer downloads `RayoPlugin.zip` from latest release automatically when `-PluginZipPath` is omitted.
+
+Generate Winget manifest package locally:
+
+```powershell
+pwsh .\scripts\generate-winget-manifest.ps1 -Version 0.3.0 -InstallerUrl "https://github.com/waar19/rayo/releases/download/v0.3.0/rayo-windows.zip" -InstallerPath .\dist\rayo-windows.zip
+```
 
 ### Troubleshooting PowerToys plugin init errors
 
 If PowerToys shows plugin initialization errors for Rayo:
 
-1. Make sure you are on the latest release (`v0.1.7` or newer).
+1. Make sure you are on the latest release (`v0.4.0` or newer).
 2. Reinstall plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex

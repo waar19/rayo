@@ -5,7 +5,7 @@ param(
     [bool]$RestartPowerToys = $true,
     [string]$Repository = "waar19/rayo",
     [string]$ReleaseTag = "",
-    [string]$ServiceDrives = "C",
+    [string]$ServiceDrives = "auto",
     [bool]$InstallBackgroundTask = $true
 )
 
@@ -259,7 +259,7 @@ if ($InstallBackgroundTask) {
         if ([string]::IsNullOrWhiteSpace($compatText)) {
             $compatText = "No output from rayo-cli compatibility check."
         }
-        throw "Installed rayo-cli is incompatible and does not support 'service install'. Use release binaries v0.1.7 or newer.`n$compatText"
+        throw "Installed rayo-cli is incompatible and does not support 'service install'. Use release binaries v0.4.0 or newer.`n$compatText"
     }
     Write-Host "Registering and starting background task: Rayo Service"
     $taskProc = Start-Process -FilePath $cliExe -ArgumentList @("service", "install", "--service-exe", $serviceExe, "--drives", $ServiceDrives) -Verb RunAs -Wait -PassThru

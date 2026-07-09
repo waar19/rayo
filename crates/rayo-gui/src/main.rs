@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
@@ -17,16 +17,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use arboard::Clipboard;
 use clap::Parser;
-use rayo_core::{FileIndex, SearchOptions, load_index};
+use rayo_core::{ContentSearchOptions, FileIndex, SearchOptions, load_index, search_content};
 use serde::{Deserialize, Serialize};
 use slint::{ModelRc, Timer, TimerMode, VecModel};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, WPARAM};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, RegisterHotKey, UnregisterHotKey, VK_SPACE,
+};
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, FindWindowW, GetMessageW, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow,
+    ShowWindow, TranslateMessage, WM_HOTKEY,
+};
 use windows::core::PCWSTR;
 
 slint::include_modules!();
 
 const DEFAULT_PIPE: &str = r"\\.\pipe\rayo-query";
+const RAYO_GUI_MUTEX_NAME: &str = "Global\\RayoGuiSingleton";
+const RAYO_HOTKEY_ID: i32 = 0x5261;
+const RELEASES_LATEST_API: &str = "https://api.github.com/repos/waar19/rayo/releases/latest";
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Rayo GUI search client")]
@@ -53,8 +64,11 @@ struct QueryRequest {
     extension: Option<String>,
     under_dir: Option<String>,
     glob: Option<String>,
+    mode: Option<String>,
+    timeout_ms: Option<u64>,
     directories_only: bool,
     files_only: bool,
+    fuzzy: bool,
     limit: Option<usize>,
 }
 
@@ -62,6 +76,8 @@ struct QueryRequest {
 struct QueryResultDto {
     path: String,
     is_directory: bool,
+    line_number: Option<u64>,
+    line_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +85,18 @@ struct QueryResponse {
     took_ms: u128,
     total_entries: usize,
     results: Vec<QueryResultDto>,
+    status: Option<String>,
+    indexed_entries: Option<usize>,
+    metrics: Option<QueryMetricsDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueryMetricsDto {
+    requests_total: u64,
+    avg_took_ms: f64,
+    last_took_ms: u128,
+    max_took_ms: u128,
+    indexed_entries: usize,
 }
 
 struct PipeClient {
@@ -119,6 +147,7 @@ struct GuiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct GuiSettings {
     under_dir: Option<String>,
     extension: Option<String>,
@@ -126,6 +155,8 @@ struct GuiSettings {
     directories_only: bool,
     limit: usize,
     debounce_ms: u64,
+    content_mode: bool,
+    fuzzy_mode: bool,
 }
 
 impl Default for GuiSettings {
@@ -137,6 +168,8 @@ impl Default for GuiSettings {
             directories_only: false,
             limit: 200,
             debounce_ms: 10,
+            content_mode: false,
+            fuzzy_mode: false,
         }
     }
 }
@@ -200,7 +233,7 @@ fn sanitize_settings(settings: &mut GuiSettings) {
         .map(|value| value.trim().trim_start_matches('.').to_ascii_lowercase())
         .filter(|value| !value.is_empty());
     settings.limit = settings.limit.clamp(10, 1000);
-    settings.debounce_ms = settings.debounce_ms.clamp(0, 200);
+    settings.debounce_ms = settings.debounce_ms.clamp(0, 500);
     if settings.files_only && settings.directories_only {
         settings.directories_only = false;
     }
@@ -216,8 +249,14 @@ fn settings_hint(settings: &GuiSettings) -> String {
     } else {
         "all"
     };
+    let search_mode = if settings.content_mode {
+        "content"
+    } else {
+        "name"
+    };
+    let fuzzy = if settings.fuzzy_mode { "on" } else { "off" };
     format!(
-        "scope={scope} ext={extension} mode={mode} limit={} debounce={}ms",
+        "search={search_mode} scope={scope} ext={extension} mode={mode} fuzzy={fuzzy} limit={} debounce={}ms",
         settings.limit, settings.debounce_ms
     )
 }
@@ -284,6 +323,108 @@ fn save_settings(settings: &GuiSettings) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct UpdateCheckState {
+    checked_at_epoch_secs: u64,
+    latest_version: Option<String>,
+}
+
+impl Default for UpdateCheckState {
+    fn default() -> Self {
+        Self {
+            checked_at_epoch_secs: 0,
+            latest_version: None,
+        }
+    }
+}
+
+fn update_state_path() -> Result<PathBuf> {
+    let app_data = std::env::var("APPDATA").context("APPDATA environment variable is not set")?;
+    Ok(PathBuf::from(app_data)
+        .join("rayo")
+        .join("update-check.json"))
+}
+
+fn parse_semver(version: &str) -> Vec<u64> {
+    version
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+fn version_is_newer(latest: &str, current: &str) -> bool {
+    let left = parse_semver(latest);
+    let right = parse_semver(current);
+    let max_len = left.len().max(right.len());
+    for idx in 0..max_len {
+        let a = *left.get(idx).unwrap_or(&0);
+        let b = *right.get(idx).unwrap_or(&0);
+        if a > b {
+            return true;
+        }
+        if a < b {
+            return false;
+        }
+    }
+    false
+}
+
+fn maybe_check_updates() -> Option<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let path = update_state_path().ok()?;
+    let state = if path.exists() {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<UpdateCheckState>(&raw).ok())
+            .unwrap_or_default()
+    } else {
+        UpdateCheckState::default()
+    };
+
+    if state.checked_at_epoch_secs > now.saturating_sub(24 * 60 * 60) {
+        if let Some(latest) = state.latest_version
+            && version_is_newer(&latest, env!("CARGO_PKG_VERSION"))
+        {
+            return Some(format!("Update available: {latest}. Run installer script."));
+        }
+        return None;
+    }
+
+    let response = ureq::get(RELEASES_LATEST_API)
+        .set("User-Agent", "rayo-gui")
+        .call()
+        .ok()?;
+    let payload: serde_json::Value = response.into_json().ok()?;
+    let latest = payload
+        .get("tag_name")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().trim_start_matches(['v', 'V']).to_string())
+        .filter(|value| !value.is_empty());
+    let next = UpdateCheckState {
+        checked_at_epoch_secs: now,
+        latest_version: latest.clone(),
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(serialized) = serde_json::to_string_pretty(&next) {
+        let _ = fs::write(&path, serialized);
+    }
+
+    if let Some(latest) = latest
+        && version_is_newer(&latest, env!("CARGO_PKG_VERSION"))
+    {
+        return Some(format!("Update available: {latest}. Run installer script."));
+    }
+    None
+}
+
 fn read_settings(settings: &Arc<RwLock<GuiSettings>>) -> GuiSettings {
     match settings.read() {
         Ok(guard) => guard.clone(),
@@ -297,6 +438,9 @@ fn apply_payload(ui: &MainWindow, payload: UiPayload, paths: &Arc<Mutex<Vec<Stri
     ui.set_status_text(payload.status_text.into());
     ui.set_mode_text(payload.mode_text.into());
     ui.set_selected_index(-1);
+    ui.set_show_context_menu(false);
+    ui.set_context_row_index(-1);
+    clear_preview(ui);
     if let Ok(mut guard) = paths.lock() {
         *guard = payload.paths;
     }
@@ -399,6 +543,72 @@ fn to_utf16_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn acquire_single_instance() -> Result<Option<HANDLE>> {
+    let name = to_utf16_null(RAYO_GUI_MUTEX_NAME);
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        .context("failed to create single-instance mutex")?;
+    let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
+    if already_exists {
+        return Ok(None);
+    }
+    Ok(Some(handle))
+}
+
+fn focus_existing_rayo_window() {
+    let title = to_utf16_null("Rayo");
+    let hwnd = match unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) } {
+        Ok(hwnd) => hwnd,
+        Err(_) => return,
+    };
+    if hwnd.0.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+fn spawn_global_hotkey_listener() {
+    thread::spawn(move || {
+        let modifiers: HOT_KEY_MODIFIERS = MOD_CONTROL | MOD_ALT;
+        if unsafe {
+            RegisterHotKey(
+                HWND::default(),
+                RAYO_HOTKEY_ID,
+                modifiers,
+                VK_SPACE.0 as u32,
+            )
+        }
+        .is_err()
+        {
+            return;
+        }
+
+        let mut message = windows::Win32::UI::WindowsAndMessaging::MSG::default();
+        loop {
+            let state = unsafe { GetMessageW(&mut message, HWND::default(), 0, 0) };
+            if state.0 <= 0 {
+                break;
+            }
+
+            if message.message == WM_HOTKEY && message.wParam == WPARAM(RAYO_HOTKEY_ID as usize) {
+                focus_existing_rayo_window();
+                continue;
+            }
+
+            unsafe {
+                let _ = TranslateMessage(&message);
+                let _ = DispatchMessageW(&message);
+            }
+        }
+
+        unsafe {
+            let _ = UnregisterHotKey(HWND::default(), RAYO_HOTKEY_ID);
+        }
+    });
+}
+
 fn selected_path(ui: &MainWindow, paths: &Arc<Mutex<Vec<String>>>) -> Option<String> {
     let idx = ui.get_selected_index();
     if idx < 0 {
@@ -409,6 +619,109 @@ fn selected_path(ui: &MainWindow, paths: &Arc<Mutex<Vec<String>>>) -> Option<Str
     guard.get(idx).cloned()
 }
 
+fn clear_preview(ui: &MainWindow) {
+    ui.set_preview_title("Select result".into());
+    ui.set_preview_body("Preview appears here".into());
+    ui.set_preview_has_image(false);
+    ui.set_preview_image(slint::Image::default());
+}
+
+fn load_preview(path: &str) -> (String, String, Option<slint::Image>) {
+    let preview_path = Path::new(path);
+    if preview_path.is_dir() {
+        return (
+            path.to_string(),
+            "Directory selected. Preview not available.".to_string(),
+            None,
+        );
+    }
+    let title = preview_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string();
+    let extension = preview_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let image_extension = matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "ico"
+    );
+    if image_extension {
+        match slint::Image::load_from_path(preview_path) {
+            Ok(image) => return (title, path.to_string(), Some(image)),
+            Err(err) => {
+                return (
+                    title,
+                    format!("Image preview failed: {err}. Path: {path}"),
+                    None,
+                );
+            }
+        }
+    }
+
+    let mut file = match File::open(preview_path) {
+        Ok(file) => file,
+        Err(err) => {
+            return (
+                title,
+                format!("Cannot open file preview: {err}. Path: {path}"),
+                None,
+            );
+        }
+    };
+    let mut sample = vec![0u8; 8192];
+    let read = match file.read(&mut sample) {
+        Ok(read) => read,
+        Err(err) => {
+            return (
+                title,
+                format!("Cannot read file preview: {err}. Path: {path}"),
+                None,
+            );
+        }
+    };
+    sample.truncate(read);
+    if sample.contains(&0) {
+        return (
+            title,
+            format!("Binary file preview not available.\n{path}"),
+            None,
+        );
+    }
+
+    let text = String::from_utf8_lossy(&sample);
+    let lines = text
+        .lines()
+        .take(100)
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.is_empty() {
+        return (title, "<empty file>".to_string(), None);
+    }
+    (title, lines, None)
+}
+
+fn update_preview_for_selected(ui: &MainWindow, paths: &Arc<Mutex<Vec<String>>>) {
+    let Some(path) = selected_path(ui, paths) else {
+        clear_preview(ui);
+        return;
+    };
+    let (title, body, image) = load_preview(&path);
+    ui.set_preview_title(title.into());
+    ui.set_preview_body(body.into());
+    if let Some(image) = image {
+        ui.set_preview_has_image(true);
+        ui.set_preview_image(image);
+    } else {
+        ui.set_preview_has_image(false);
+        ui.set_preview_image(slint::Image::default());
+    }
+}
+
 fn run_search(
     config: &GuiConfig,
     settings_state: &Arc<RwLock<GuiSettings>>,
@@ -417,7 +730,16 @@ fn run_search(
     pipe_client: &mut Option<PipeClient>,
 ) -> UiPayload {
     let settings = read_settings(settings_state);
-    if query.trim().chars().count() < 2 && settings.under_dir.is_none() {
+    let trimmed_query = query.trim().to_string();
+    if settings.content_mode && settings.under_dir.is_none() {
+        return UiPayload {
+            rows: Vec::new(),
+            paths: Vec::new(),
+            status_text: "Content mode needs scope folder in Settings.".to_string(),
+            mode_text: "idle".to_string(),
+        };
+    }
+    if trimmed_query.chars().count() < 2 && settings.under_dir.is_none() {
         return UiPayload {
             rows: Vec::new(),
             paths: Vec::new(),
@@ -427,52 +749,119 @@ fn run_search(
     }
 
     let request = QueryRequest {
-        query: query.clone(),
+        query: trimmed_query.clone(),
         extension: settings.extension.clone(),
         under_dir: settings.under_dir.clone(),
         glob: None,
+        mode: if settings.content_mode {
+            Some("content".to_string())
+        } else {
+            Some("name".to_string())
+        },
+        timeout_ms: if settings.content_mode {
+            Some(3_000)
+        } else {
+            None
+        },
         directories_only: settings.directories_only,
         files_only: settings.files_only,
+        fuzzy: settings.fuzzy_mode,
         limit: Some(settings.limit),
     };
 
-    let (raw_results, took_ms, total_entries, mode_text) =
-        match query_service(&config.pipe_name, &request, pipe_client) {
-            Ok(response) => (
+    let (raw_results, took_ms, total_entries, mode_text) = match query_service(
+        &config.pipe_name,
+        &request,
+        pipe_client,
+    ) {
+        Ok(response) => {
+            if response.status.as_deref() == Some("starting") {
+                let scanned = response.indexed_entries.unwrap_or(0);
+                return UiPayload {
+                    rows: Vec::new(),
+                    paths: Vec::new(),
+                    status_text: format!("Service starting... indexed={scanned}"),
+                    mode_text: "service (starting)".to_string(),
+                };
+            }
+            (
                 response.results,
                 response.took_ms,
                 response.total_entries,
-                "service".to_string(),
-            ),
-            Err(service_err) => {
-                let started = Instant::now();
-                let total_entries = match ensure_fallback_index_loaded(config, fallback_index) {
-                    Ok(total_entries) => total_entries,
+                if let Some(metrics) = response.metrics {
+                    format!(
+                        "service | indexed={} req={} avg={:.2}ms",
+                        metrics.indexed_entries, metrics.requests_total, metrics.avg_took_ms
+                    )
+                } else {
+                    "service".to_string()
+                },
+            )
+        }
+        Err(service_err) => {
+            let started = Instant::now();
+            let total_entries = match ensure_fallback_index_loaded(config, fallback_index) {
+                Ok(total_entries) => total_entries,
+                Err(err) => {
+                    return UiPayload {
+                        rows: Vec::new(),
+                        paths: Vec::new(),
+                        status_text: format!(
+                            "Service unavailable ({service_err}). Fallback failed: {err}"
+                        ),
+                        mode_text: "error".to_string(),
+                    };
+                }
+            };
+            let guard = match fallback_index.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(index) = guard.as_ref() else {
+                return UiPayload {
+                    rows: Vec::new(),
+                    paths: Vec::new(),
+                    status_text: "Fallback index unavailable.".to_string(),
+                    mode_text: "error".to_string(),
+                };
+            };
+            if settings.content_mode {
+                match search_content(&ContentSearchOptions {
+                    query: trimmed_query.clone(),
+                    under_dir: settings.under_dir.clone().map(PathBuf::from),
+                    extension: settings.extension.clone(),
+                    limit: settings.limit,
+                    timeout: Duration::from_secs(3),
+                }) {
+                    Ok(content) => (
+                        content
+                            .matches
+                            .into_iter()
+                            .map(|item| QueryResultDto {
+                                path: item.path,
+                                is_directory: false,
+                                line_number: Some(item.line_number),
+                                line_text: Some(item.line_text),
+                            })
+                            .collect::<Vec<_>>(),
+                        content.took.as_millis(),
+                        total_entries,
+                        format!("fallback-content ({service_err})"),
+                    ),
                     Err(err) => {
                         return UiPayload {
                             rows: Vec::new(),
                             paths: Vec::new(),
                             status_text: format!(
-                                "Service unavailable ({service_err}). Fallback failed: {err}"
+                                "Service unavailable ({service_err}). Content fallback failed: {err}"
                             ),
                             mode_text: "error".to_string(),
                         };
                     }
-                };
-                let guard = match fallback_index.read() {
-                    Ok(guard) => guard,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                let Some(index) = guard.as_ref() else {
-                    return UiPayload {
-                        rows: Vec::new(),
-                        paths: Vec::new(),
-                        status_text: "Fallback index unavailable.".to_string(),
-                        mode_text: "error".to_string(),
-                    };
-                };
+                }
+            } else {
                 let search_results = index.search(&SearchOptions {
-                    query,
+                    query: trimmed_query.clone(),
                     extension: settings.extension.clone(),
                     under_dir: settings.under_dir.clone(),
                     glob: None,
@@ -480,6 +869,7 @@ fn run_search(
                     files_only: settings.files_only,
                     limit: settings.limit,
                     prefer_trigram: false,
+                    fuzzy: settings.fuzzy_mode,
                 });
                 (
                     search_results
@@ -487,6 +877,8 @@ fn run_search(
                         .map(|item| QueryResultDto {
                             path: item.path,
                             is_directory: item.is_directory,
+                            line_number: None,
+                            line_text: None,
                         })
                         .collect::<Vec<_>>(),
                     started.elapsed().as_millis(),
@@ -494,7 +886,8 @@ fn run_search(
                     format!("fallback ({service_err})"),
                 )
             }
-        };
+        }
+    };
 
     let mut rows = Vec::with_capacity(raw_results.len());
     let mut paths = Vec::with_capacity(raw_results.len());
@@ -504,11 +897,29 @@ fn run_search(
             .and_then(|part| part.to_str())
             .map(|part| part.to_string())
             .unwrap_or_else(|| item.path.clone());
-        let kind = if item.is_directory { "DIR" } else { "FILE" };
+        let kind = if item.line_number.is_some() {
+            "LINE"
+        } else if item.is_directory {
+            "DIR"
+        } else {
+            "FILE"
+        };
+        let subtitle = if let Some(line_number) = item.line_number {
+            let excerpt = item
+                .line_text
+                .as_deref()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .unwrap_or("<empty>");
+            format!("{}:{}  {}", item.path, line_number, excerpt)
+        } else {
+            item.path.clone()
+        };
         rows.push(ResultRow {
             kind: kind.into(),
             name: name.into(),
             path: item.path.clone().into(),
+            subtitle: subtitle.into(),
         });
         paths.push(item.path);
     }
@@ -575,6 +986,15 @@ fn spawn_search_worker(
 }
 
 fn main() -> Result<()> {
+    let _single_instance_guard = match acquire_single_instance()? {
+        Some(handle) => handle,
+        None => {
+            focus_existing_rayo_window();
+            return Ok(());
+        }
+    };
+    spawn_global_hotkey_listener();
+
     let cli = Cli::parse();
     let mut startup_query = cli.query.clone();
     let (mut initial_settings, startup_notice) = load_settings().unwrap_or_else(|err| {
@@ -634,6 +1054,8 @@ fn main() -> Result<()> {
     ui.set_settings_directories_only(initial_settings.directories_only);
     ui.set_settings_limit(initial_settings.limit as i32);
     ui.set_settings_debounce_ms(initial_settings.debounce_ms as i32);
+    ui.set_settings_content_mode(initial_settings.content_mode);
+    ui.set_settings_fuzzy_mode(initial_settings.fuzzy_mode);
     ui.set_settings_hint(settings_hint(&initial_settings).into());
     if let Some(notice) = startup_notice {
         ui.set_status_text(notice.into());
@@ -683,6 +1105,19 @@ fn main() -> Result<()> {
         });
     }
 
+    {
+        let update_ui = ui.as_weak();
+        thread::spawn(move || {
+            if let Some(message) = maybe_check_updates() {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = update_ui.upgrade() {
+                        ui.set_status_text(message.into());
+                    }
+                });
+            }
+        });
+    }
+
     let debounce_timer = Rc::new(RefCell::new(Timer::default()));
     let search_tx = spawn_search_worker(
         ui.as_weak(),
@@ -705,7 +1140,11 @@ fn main() -> Result<()> {
             let search_tx2 = search_tx.clone();
             let debounce_ms = {
                 let settings = read_settings(&settings_state);
-                settings.debounce_ms
+                if settings.content_mode {
+                    settings.debounce_ms.max(500)
+                } else {
+                    settings.debounce_ms
+                }
             };
             timer.borrow_mut().start(
                 TimerMode::SingleShot,
@@ -742,6 +1181,29 @@ fn main() -> Result<()> {
     {
         let ui_weak = ui.as_weak();
         let settings_state = settings_state.clone();
+        let latest_request = latest_request.clone();
+        let search_tx = search_tx.clone();
+        ui.on_search_mode_changed(move |content_mode| {
+            {
+                let mut guard = match settings_state.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.content_mode = content_mode;
+                let _ = save_settings(&guard);
+            }
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_settings_content_mode(content_mode);
+                let current_settings = read_settings(&settings_state);
+                ui.set_settings_hint(settings_hint(&current_settings).into());
+            }
+            trigger_search(ui_weak.clone(), latest_request.clone(), search_tx.clone());
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let settings_state = settings_state.clone();
         ui.on_open_settings(move || {
             let settings = read_settings(&settings_state);
             if let Some(ui) = ui_weak.upgrade() {
@@ -751,6 +1213,8 @@ fn main() -> Result<()> {
                 ui.set_settings_directories_only(settings.directories_only);
                 ui.set_settings_limit(settings.limit as i32);
                 ui.set_settings_debounce_ms(settings.debounce_ms as i32);
+                ui.set_settings_content_mode(settings.content_mode);
+                ui.set_settings_fuzzy_mode(settings.fuzzy_mode);
                 ui.set_settings_error_text("".into());
                 ui.set_show_settings(true);
             }
@@ -778,6 +1242,8 @@ fn main() -> Result<()> {
                 ui.set_settings_directories_only(defaults.directories_only);
                 ui.set_settings_limit(defaults.limit as i32);
                 ui.set_settings_debounce_ms(defaults.debounce_ms as i32);
+                ui.set_settings_content_mode(defaults.content_mode);
+                ui.set_settings_fuzzy_mode(defaults.fuzzy_mode);
                 ui.set_settings_error_text("".into());
             }
         });
@@ -802,7 +1268,14 @@ fn main() -> Result<()> {
         let latest_request = latest_request.clone();
         let search_tx = search_tx.clone();
         ui.on_save_settings(
-            move |under_dir, extension, files_only, directories_only, limit, debounce_ms| {
+            move |under_dir,
+                  extension,
+                  files_only,
+                  directories_only,
+                  limit,
+                  debounce_ms,
+                  content_mode,
+                  fuzzy_mode| {
                 let mut next = GuiSettings {
                     under_dir: normalize_optional_text(under_dir.to_string()),
                     extension: normalize_optional_text(extension.to_string()),
@@ -810,6 +1283,8 @@ fn main() -> Result<()> {
                     directories_only,
                     limit: limit.max(0) as usize,
                     debounce_ms: debounce_ms.max(0) as u64,
+                    content_mode,
+                    fuzzy_mode,
                 };
                 sanitize_settings(&mut next);
                 if let Some(validation_error) = validate_settings(&next) {
@@ -853,9 +1328,34 @@ fn main() -> Result<()> {
 
     {
         let ui_weak = ui.as_weak();
+        let paths = result_paths.clone();
         ui.on_select_row(move |idx| {
             if let Some(ui) = ui_weak.upgrade() {
                 ui.set_selected_index(idx);
+                update_preview_for_selected(&ui, &paths);
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let paths = result_paths.clone();
+        ui.on_show_row_menu(move |idx| {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_selected_index(idx);
+                ui.set_context_row_index(idx);
+                ui.set_show_context_menu(true);
+                update_preview_for_selected(&ui, &paths);
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_hide_row_menu(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_show_context_menu(false);
+                ui.set_context_row_index(-1);
             }
         });
     }
@@ -878,6 +1378,8 @@ fn main() -> Result<()> {
         let paths = result_paths.clone();
         ui.on_open_selected(move || {
             if let Some(ui) = ui_weak.upgrade() {
+                ui.set_show_context_menu(false);
+                ui.set_context_row_index(-1);
                 if let Some(path) = selected_path(&ui, &paths) {
                     if let Err(err) = shell_open(&path, false) {
                         ui.set_status_text(format!("Open failed: {err}").into());
@@ -892,6 +1394,8 @@ fn main() -> Result<()> {
         let paths = result_paths.clone();
         ui.on_open_selected_admin(move || {
             if let Some(ui) = ui_weak.upgrade() {
+                ui.set_show_context_menu(false);
+                ui.set_context_row_index(-1);
                 if let Some(path) = selected_path(&ui, &paths) {
                     if let Err(err) = shell_open(&path, true) {
                         ui.set_status_text(format!("Open as admin failed: {err}").into());
@@ -906,6 +1410,8 @@ fn main() -> Result<()> {
         let paths = result_paths.clone();
         ui.on_open_folder_selected(move || {
             if let Some(ui) = ui_weak.upgrade() {
+                ui.set_show_context_menu(false);
+                ui.set_context_row_index(-1);
                 if let Some(path) = selected_path(&ui, &paths) {
                     if let Err(err) = open_containing_folder(&path) {
                         ui.set_status_text(format!("Open folder failed: {err}").into());
@@ -920,6 +1426,8 @@ fn main() -> Result<()> {
         let paths = result_paths.clone();
         ui.on_copy_path_selected(move || {
             if let Some(ui) = ui_weak.upgrade() {
+                ui.set_show_context_menu(false);
+                ui.set_context_row_index(-1);
                 if let Some(path) = selected_path(&ui, &paths) {
                     match Clipboard::new() {
                         Ok(mut clipboard) => {

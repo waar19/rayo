@@ -4,6 +4,7 @@ export struct ResultRow {
     kind: string,
     name: string,
     path: string,
+    subtitle: string,
 }
 
 export component MainWindow inherits Window {
@@ -19,6 +20,10 @@ export component MainWindow inherits Window {
     in-out property <string> under-text: "<none>";
     in-out property <int> selected-index: -1;
     in-out property <[ResultRow]> results: [];
+    in-out property <string> preview-title: "Select result";
+    in-out property <string> preview-body: "Preview appears here";
+    in-out property <image> preview-image;
+    in-out property <bool> preview-has-image: false;
     in-out property <bool> show-settings: false;
     in-out property <string> settings-under-dir: "";
     in-out property <string> settings-extension: "";
@@ -26,6 +31,10 @@ export component MainWindow inherits Window {
     in-out property <bool> settings-directories-only: false;
     in-out property <int> settings-limit: 200;
     in-out property <int> settings-debounce-ms: 10;
+    in-out property <bool> settings-content-mode: false;
+    in-out property <bool> settings-fuzzy-mode: false;
+    in-out property <bool> show-context-menu: false;
+    in-out property <int> context-row-index: -1;
     in-out property <string> settings-error-text: "";
     in-out property <string> settings-hint: "";
     forward-focus: keyboard-shortcuts;
@@ -33,13 +42,16 @@ export component MainWindow inherits Window {
     callback query-edited(string);
     callback clear-query();
     callback search-now();
+    callback search-mode-changed(bool);
     callback open-settings();
-    callback save-settings(string, string, bool, bool, int, int);
+    callback save-settings(string, string, bool, bool, int, int, bool, bool);
     callback cancel-settings();
     callback reset-settings();
     callback clear-settings-filters();
     callback select-row(int);
     callback activate-row(int);
+    callback show-row-menu(int);
+    callback hide-row-menu();
     callback open-selected();
     callback open-selected-admin();
     callback open-folder-selected();
@@ -70,7 +82,7 @@ export component MainWindow inherits Window {
 
                 search-input := LineEdit {
                     text <=> root.query;
-                    placeholder-text: "Search files and folders";
+                    placeholder-text: root.settings-content-mode ? "Search inside file contents (regex)" : "Search files and folders";
                     font-size: 15px;
                     height: 36px;
                     changed text => {
@@ -89,6 +101,24 @@ export component MainWindow inherits Window {
                     text: "Search";
                     horizontal-stretch: 0;
                     clicked => { root.search-now(); }
+                }
+
+                Button {
+                    text: "Name";
+                    horizontal-stretch: 0;
+                    enabled: root.settings-content-mode;
+                    clicked => {
+                        root.search-mode-changed(false);
+                    }
+                }
+
+                Button {
+                    text: "Content";
+                    horizontal-stretch: 0;
+                    enabled: !root.settings-content-mode;
+                    clicked => {
+                        root.search-mode-changed(true);
+                    }
                 }
 
                 Button {
@@ -132,50 +162,135 @@ export component MainWindow inherits Window {
             }
 
             if root.results.length > 0 : ScrollView {
-                VerticalBox {
-                    spacing: 0px;
+                HorizontalBox {
+                    spacing: 10px;
+                    padding: 10px;
 
-                    for row[idx] in root.results: Rectangle {
-                        height: 48px;
-                        background: row-touch.has-hover ? #232a35 : (root.selected-index == idx ? #2d4260 : #111317);
+                    ScrollView {
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+                        VerticalBox {
+                            spacing: 0px;
 
-                        HorizontalBox {
-                            padding: 8px;
-                            spacing: 10px;
+                            for row[idx] in root.results: Rectangle {
+                                height: 48px;
+                                background: row-touch.has-hover ? #232a35 : (root.selected-index == idx ? #2d4260 : #111317);
+
+                                HorizontalBox {
+                                    padding: 8px;
+                                    spacing: 10px;
+
+                                    Text {
+                                        text: row.kind;
+                                        color: #8fa4bf;
+                                        width: 46px;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                    }
+
+                                    VerticalBox {
+                                        spacing: 2px;
+                                        Text {
+                                            text: row.name;
+                                            color: #d7e0f0;
+                                            font-size: 14px;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: row.subtitle;
+                                            color: #8fa4bf;
+                                            font-size: 12px;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+
+                                row-touch := TouchArea {
+                                    clicked => {
+                                        root.hide-row-menu();
+                                        root.select-row(idx);
+                                    }
+                                    double-clicked => {
+                                        root.hide-row-menu();
+                                        root.activate-row(idx);
+                                    }
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                                            root.show-row-menu(idx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 320px;
+                        border-color: #2a2f36;
+                        border-width: 1px;
+                        border-radius: 8px;
+                        background: #171a21;
+
+                        VerticalBox {
+                            spacing: 8px;
+                            padding: 10px;
 
                             Text {
-                                text: row.kind;
-                                color: #8fa4bf;
-                                width: 46px;
-                                vertical-alignment: center;
-                                horizontal-alignment: center;
+                                text: root.preview-title;
+                                color: #d7e0f0;
+                                font-size: 14px;
+                                font-weight: 600;
+                                overflow: elide;
                             }
 
-                            VerticalBox {
-                                spacing: 2px;
+                            if root.preview-has-image : Image {
+                                source: root.preview-image;
+                                width: parent.width - 20px;
+                                height: 180px;
+                                image-fit: contain;
+                            }
+
+                            ScrollView {
+                                vertical-stretch: 1;
                                 Text {
-                                    text: row.name;
-                                    color: #d7e0f0;
-                                    font-size: 14px;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    text: row.path;
+                                    text: root.preview-body;
                                     color: #8fa4bf;
-                                    font-size: 12px;
-                                    overflow: elide;
+                                    wrap: word-wrap;
                                 }
                             }
                         }
+                    }
+                }
+            }
 
-                        row-touch := TouchArea {
-                            clicked => {
-                                root.select-row(idx);
-                            }
-                            double-clicked => {
-                                root.activate-row(idx);
-                            }
-                        }
+            if root.show-context-menu : Rectangle {
+                width: 190px;
+                height: 130px;
+                x: 18px;
+                y: min(parent.height - self.height - 12px, max(12px, 16px + root.context-row-index * 48px));
+                border-color: #2a2f36;
+                border-width: 1px;
+                border-radius: 8px;
+                background: #171a21;
+
+                VerticalBox {
+                    spacing: 4px;
+                    padding: 6px;
+                    Button {
+                        text: "Open";
+                        clicked => { root.open-selected(); root.hide-row-menu(); }
+                    }
+                    Button {
+                        text: "Open as admin";
+                        clicked => { root.open-selected-admin(); root.hide-row-menu(); }
+                    }
+                    Button {
+                        text: "Open folder";
+                        clicked => { root.open-folder-selected(); root.hide-row-menu(); }
+                    }
+                    Button {
+                        text: "Copy path";
+                        clicked => { root.copy-path-selected(); root.hide-row-menu(); }
                     }
                 }
             }
@@ -229,6 +344,18 @@ export component MainWindow inherits Window {
                                 text: "Tip: Save applies filters immediately to the current search.";
                                 color: #8fa4bf;
                                 font-size: 12px;
+                            }
+
+                            HorizontalBox {
+                                spacing: 14px;
+                                CheckBox {
+                                    text: "Content mode";
+                                    checked <=> root.settings-content-mode;
+                                }
+                                CheckBox {
+                                    text: "Fuzzy ranking";
+                                    checked <=> root.settings-fuzzy-mode;
+                                }
                             }
 
                             if root.settings-error-text != "" : Text {
@@ -316,7 +443,9 @@ export component MainWindow inherits Window {
                                             root.settings-files-only,
                                             root.settings-directories-only,
                                             root.settings-limit,
-                                            root.settings-debounce-ms
+                                            root.settings-debounce-ms,
+                                            root.settings-content-mode,
+                                            root.settings-fuzzy-mode
                                         );
                                     }
                                 }
@@ -381,6 +510,10 @@ export component MainWindow inherits Window {
             }
             if (event.text == Key.Escape && root.show-settings) {
                 root.cancel-settings();
+                return accept;
+            }
+            if (event.text == Key.Escape && root.show-context-menu) {
+                root.hide-row-menu();
                 return accept;
             }
             return reject;

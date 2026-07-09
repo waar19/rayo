@@ -31,6 +31,16 @@ jobs:
         shell: pwsh
         run: .\scripts\release-windows.ps1
 
+      - name: Generate Winget manifest package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $installerUrl = "https://github.com/waar19/rayo/releases/download/${{ github.ref_name }}/rayo-windows.zip"
+          .\scripts\generate-winget-manifest.ps1 `
+            -Version $version `
+            -InstallerUrl $installerUrl `
+            -InstallerPath ".\dist\rayo-windows.zip"
+
       - name: Publish PowerToys plugin
         run: dotnet publish .\integrations\powertoys-run\Community.PowerToys.Run.Plugin.Rayo.csproj -c Release -o .\dist\powertoys-run\RayoPlugin
 
@@ -87,5 +97,6 @@ jobs:
           files: |
             dist/rayo-windows.zip
             dist/powertoys-run/RayoPlugin.zip
+            dist/winget/rayo-winget-manifest-*.zip
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use rayo_core::{
-    FileIndex, SearchOptions, is_running_as_admin, load_index, normalize_drive, save_index,
+    ContentSearchOptions, FileIndex, SearchOptions, is_running_as_admin, load_index,
+    normalize_drive, save_index, search_content,
 };
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
@@ -26,12 +27,15 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-use windows::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+use windows::Win32::Storage::FileSystem::{
+    GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, PIPE_ACCESS_DUPLEX,
+};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::System::WindowsProgramming::DRIVE_FIXED;
 use windows::core::{HRESULT, PCWSTR};
 
 const PIPE_NAME: &str = r"\\.\pipe\rayo-query";
@@ -45,7 +49,7 @@ static PIPE_SECURITY_DESCRIPTOR: OnceLock<isize> = OnceLock::new();
     about = "Background Rayo service with live index and named pipe queries"
 )]
 struct Cli {
-    #[arg(long, default_value = "C")]
+    #[arg(long, default_value = "auto")]
     drive: String,
     #[arg(long)]
     drives: Option<String>,
@@ -67,14 +71,22 @@ struct Cli {
 
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
+    #[serde(default)]
     query: String,
     extension: Option<String>,
     under_dir: Option<String>,
     glob: Option<String>,
+    mode: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
     #[serde(default)]
     directories_only: bool,
     #[serde(default)]
     files_only: bool,
+    #[serde(default)]
+    fuzzy: bool,
+    #[serde(default)]
+    metrics: bool,
     limit: Option<usize>,
 }
 
@@ -82,6 +94,10 @@ struct QueryRequest {
 struct QueryResultDto {
     path: String,
     is_directory: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,6 +109,32 @@ struct QueryResponse {
     status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     indexed_entries: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metrics: Option<QueryMetricsDto>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct QueryMetricsDto {
+    requests_total: u64,
+    avg_took_ms: f64,
+    last_took_ms: u128,
+    max_took_ms: u128,
+    indexed_entries: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestMode {
+    Name,
+    Content,
+}
+
+impl RequestMode {
+    fn from_request(value: Option<&str>) -> Self {
+        match value {
+            Some(mode) if mode.eq_ignore_ascii_case("content") => Self::Content,
+            _ => Self::Name,
+        }
+    }
 }
 
 impl QueryResponse {
@@ -103,6 +145,7 @@ impl QueryResponse {
             results,
             status: None,
             indexed_entries: None,
+            metrics: None,
         }
     }
 
@@ -113,6 +156,7 @@ impl QueryResponse {
             results: Vec::new(),
             status: Some("starting"),
             indexed_entries: Some(indexed_entries),
+            metrics: None,
         }
     }
 }
@@ -167,6 +211,11 @@ struct BootstrapIndex {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     require_admin()?;
+    let auto_drive_mode = cli
+        .drives
+        .as_deref()
+        .unwrap_or(cli.drive.as_str())
+        .eq_ignore_ascii_case("auto");
     let drives = parse_drives(&cli.drive, cli.drives.as_deref())?;
     let log_path = cli.log_file.unwrap_or_else(default_background_log_path);
     let logger = open_log_writer(&log_path)?;
@@ -288,15 +337,37 @@ fn main() -> Result<()> {
         }));
     }
 
+    if auto_drive_mode {
+        let mut known_indexes = std::collections::HashMap::new();
+        for state in drive_states.iter() {
+            known_indexes.insert(state.drive.clone(), state.index.clone());
+        }
+        let auto_running = running.clone();
+        let auto_logger = logger.clone();
+        let auto_state = service_state.clone();
+        let auto_index_base = index_base.clone();
+        let auto_trigram = cli.trigram;
+        thread::spawn(move || {
+            run_auto_drive_monitor(
+                known_indexes,
+                auto_state,
+                auto_running,
+                auto_logger,
+                auto_index_base,
+                auto_trigram,
+            );
+        });
+    }
+
     let metrics_running = running.clone();
-    let metrics_indexes = indexes.clone();
+    let metrics_service_state = service_state.clone();
     let metrics_state = metrics.clone();
     let metrics_interval = Duration::from_secs(cli.metrics_interval_secs.max(5));
     let metrics_logger = logger.clone();
     let metrics_thread = thread::spawn(move || {
         run_metrics_reporter(
             metrics_state,
-            metrics_indexes,
+            metrics_service_state,
             metrics_running,
             metrics_interval,
             metrics_logger,
@@ -326,6 +397,13 @@ fn require_admin() -> Result<()> {
 
 fn parse_drives(default_drive: &str, drives_arg: Option<&str>) -> Result<Vec<String>> {
     let raw = drives_arg.unwrap_or(default_drive);
+    if raw.eq_ignore_ascii_case("auto") {
+        let detected = detect_fixed_ntfs_drives()?;
+        if detected.is_empty() {
+            return Err(anyhow!("no NTFS fixed drives detected for --drives auto"));
+        }
+        return Ok(detected);
+    }
     let mut drives = Vec::new();
     let mut seen = HashSet::new();
     for candidate in raw.split(',') {
@@ -340,6 +418,50 @@ fn parse_drives(default_drive: &str, drives_arg: Option<&str>) -> Result<Vec<Str
     }
     if drives.is_empty() {
         return Err(anyhow!("no valid drives provided"));
+    }
+    Ok(drives)
+}
+
+fn detect_fixed_ntfs_drives() -> Result<Vec<String>> {
+    let bitmask = unsafe { GetLogicalDrives() };
+    if bitmask == 0 {
+        return Err(anyhow!("failed to enumerate logical drives"));
+    }
+
+    let mut drives = Vec::new();
+    for letter in b'A'..=b'Z' {
+        let bit = 1u32 << (letter - b'A');
+        if (bitmask & bit) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", letter as char);
+        let root_w = to_utf16_null(&root);
+        let drive_type = unsafe { GetDriveTypeW(PCWSTR(root_w.as_ptr())) };
+        if drive_type != DRIVE_FIXED {
+            continue;
+        }
+
+        let mut fs_name_buffer = vec![0u16; 64];
+        let has_volume = unsafe {
+            GetVolumeInformationW(
+                PCWSTR(root_w.as_ptr()),
+                None,
+                None,
+                None,
+                None,
+                Some(&mut fs_name_buffer),
+            )
+        };
+        if has_volume.is_err() {
+            continue;
+        }
+
+        let fs_name = String::from_utf16_lossy(&fs_name_buffer)
+            .trim_matches('\0')
+            .to_string();
+        if fs_name.eq_ignore_ascii_case("NTFS") {
+            drives.push(format!("{}:", letter as char));
+        }
     }
     Ok(drives)
 }
@@ -606,6 +728,117 @@ fn run_watch_loop(
     }
 }
 
+fn run_auto_drive_monitor(
+    mut known_indexes: HashMap<String, Arc<RwLock<FileIndex>>>,
+    service_state: Arc<ServiceState>,
+    running: Arc<AtomicBool>,
+    logger: SharedLog,
+    index_base: Option<PathBuf>,
+    trigram: bool,
+) {
+    while running.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_secs(60));
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let detected = match detect_fixed_ntfs_drives() {
+            Ok(drives) => drives,
+            Err(err) => {
+                log_error(&logger, format!("auto-drive detect failed: {err:#}"));
+                continue;
+            }
+        };
+        let detected_set: HashSet<String> = detected.iter().cloned().collect();
+        let known_set: HashSet<String> = known_indexes.keys().cloned().collect();
+
+        let mut changed = false;
+        for drive in detected_set.difference(&known_set) {
+            let index_path = match &index_base {
+                Some(base) => drive_index_path(base, drive, true),
+                None => default_background_index_path_for_drive(drive),
+            };
+            let loaded = if index_path.exists() {
+                match load_index(&index_path) {
+                    Ok(mut index) => {
+                        if index.drive.eq_ignore_ascii_case(drive) {
+                            if trigram {
+                                index.set_trigram_enabled(true);
+                            }
+                            Some(index)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+
+            let mut index = match loaded {
+                Some(index) => index,
+                None => match build_index_with_progress(drive, &logger, None, 0) {
+                    Ok(mut index) => {
+                        if trigram {
+                            index.set_trigram_enabled(true);
+                        }
+                        if let Err(err) = save_index(&index, &index_path) {
+                            log_error(
+                                &logger,
+                                format!(
+                                    "failed to persist auto-detected drive {} index: {err:#}",
+                                    drive
+                                ),
+                            );
+                        }
+                        index
+                    }
+                    Err(err) => {
+                        log_error(
+                            &logger,
+                            format!(
+                                "failed to build index for auto-detected drive {}: {err:#}",
+                                drive
+                            ),
+                        );
+                        continue;
+                    }
+                },
+            };
+            index.drive = drive.clone();
+            known_indexes.insert(drive.clone(), Arc::new(RwLock::new(index)));
+            log_info(&logger, format!("Auto-drive added: {drive}"));
+            changed = true;
+        }
+
+        let removed: Vec<String> = known_set
+            .difference(&detected_set)
+            .map(|drive| drive.to_string())
+            .collect();
+        for drive in removed {
+            known_indexes.remove(&drive);
+            log_info(&logger, format!("Auto-drive removed: {drive}"));
+            changed = true;
+        }
+
+        if changed {
+            let indexes = known_indexes.values().cloned().collect::<Vec<_>>();
+            let indexed_entries = indexes
+                .iter()
+                .map(|index| match index.read() {
+                    Ok(guard) => guard.entries.len(),
+                    Err(poisoned) => poisoned.into_inner().entries.len(),
+                })
+                .sum::<usize>();
+            service_state.update_indexes(indexes);
+            service_state
+                .indexed_entries
+                .store(indexed_entries, Ordering::Relaxed);
+        }
+    }
+}
+
 fn run_pipe_server(
     service_state: Arc<ServiceState>,
     running: Arc<AtomicBool>,
@@ -719,16 +952,25 @@ fn handle_pipe_client(
         let request: QueryRequest =
             serde_json::from_str(request_line.trim_end()).context("invalid JSON request")?;
         let limit = request.limit.unwrap_or(default_limit).max(1);
-        let mut options = SearchOptions {
-            query: request.query,
-            extension: request.extension,
-            under_dir: request.under_dir,
-            glob: request.glob,
-            directories_only: request.directories_only,
-            files_only: request.files_only,
-            limit,
-            prefer_trigram: false,
-        };
+        let query_mode = RequestMode::from_request(request.mode.as_deref());
+        let content_timeout = Duration::from_millis(request.timeout_ms.unwrap_or(3_000).max(200));
+        let indexed_entries_now = service_state.indexed_entries.load(Ordering::Relaxed);
+
+        if request.metrics {
+            let mut response = QueryResponse::from_results(0, indexed_entries_now, Vec::new());
+            response.metrics = Some(snapshot_metrics(&metrics, indexed_entries_now));
+            if !service_state.ready.load(Ordering::SeqCst) {
+                response.status = Some("starting");
+                response.indexed_entries = Some(indexed_entries_now);
+            }
+            serde_json::to_writer(&mut stream, &response)
+                .context("failed to serialize metrics response")?;
+            stream
+                .write_all(b"\n")
+                .context("failed to write metrics response terminator")?;
+            stream.flush().context("failed to flush metrics response")?;
+            continue;
+        }
 
         if !service_state.ready.load(Ordering::SeqCst) {
             let response =
@@ -758,21 +1000,100 @@ fn handle_pipe_client(
         }
 
         let started = Instant::now();
-        let query_lower = options.query.to_ascii_lowercase();
         let mut total_entries = 0usize;
-        let mut merged = Vec::new();
+        let mut results = Vec::new();
         for index in indexes.iter() {
             let guard = match index.read() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
             total_entries += guard.entries.len();
-            options.prefer_trigram = guard.trigram_enabled();
-            merged.extend(guard.search(&options));
         }
-        merged.sort_by(|a, b| compare_relevance_paths(&a.path, &b.path, &query_lower));
-        if merged.len() > limit {
-            merged.truncate(limit);
+        match query_mode {
+            RequestMode::Name => {
+                let mut options = SearchOptions {
+                    query: request.query,
+                    extension: request.extension,
+                    under_dir: request.under_dir,
+                    glob: request.glob,
+                    directories_only: request.directories_only,
+                    files_only: request.files_only,
+                    limit,
+                    prefer_trigram: false,
+                    fuzzy: request.fuzzy,
+                };
+                let query_lower = options.query.to_ascii_lowercase();
+                let mut merged = Vec::new();
+                for index in indexes.iter() {
+                    let guard = match index.read() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    options.prefer_trigram = guard.trigram_enabled();
+                    merged.extend(guard.search(&options));
+                }
+                merged.sort_by(|a, b| compare_relevance_paths(&a.path, &b.path, &query_lower));
+                if merged.len() > limit {
+                    merged.truncate(limit);
+                }
+                results.extend(merged.into_iter().map(|item| QueryResultDto {
+                    path: item.path,
+                    is_directory: item.is_directory,
+                    line_number: None,
+                    line_text: None,
+                }));
+            }
+            RequestMode::Content => {
+                let query = request.query.trim().to_string();
+                if !query.is_empty() {
+                    let mut scopes = Vec::new();
+                    if let Some(under_dir) = request.under_dir.as_ref() {
+                        scopes.push(PathBuf::from(under_dir));
+                    } else {
+                        let mut seen = HashSet::new();
+                        for index in indexes.iter() {
+                            let guard = match index.read() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if seen.insert(guard.drive.clone()) {
+                                scopes.push(PathBuf::from(format!("{}\\", guard.drive)));
+                            }
+                        }
+                    }
+
+                    let mut collected = Vec::new();
+                    for scope in scopes {
+                        if collected.len() >= limit || started.elapsed() >= content_timeout {
+                            break;
+                        }
+                        let remaining_limit = limit - collected.len();
+                        let remaining_timeout = content_timeout.saturating_sub(started.elapsed());
+                        if remaining_timeout.is_zero() {
+                            break;
+                        }
+                        let content_result = search_content(&ContentSearchOptions {
+                            query: query.clone(),
+                            under_dir: Some(scope),
+                            extension: request.extension.clone(),
+                            limit: remaining_limit,
+                            timeout: remaining_timeout,
+                        })?;
+                        for item in content_result.matches {
+                            if collected.len() >= limit {
+                                break;
+                            }
+                            collected.push(QueryResultDto {
+                                path: item.path,
+                                is_directory: false,
+                                line_number: Some(item.line_number),
+                                line_text: Some(item.line_text),
+                            });
+                        }
+                    }
+                    results = collected;
+                }
+            }
         }
 
         let took_ms = started.elapsed().as_millis();
@@ -782,17 +1103,8 @@ fn handle_pipe_client(
             guard.last_took_ms = took_ms;
             guard.max_took_ms = guard.max_took_ms.max(took_ms);
         }
-        let response = QueryResponse::from_results(
-            took_ms,
-            total_entries,
-            merged
-                .into_iter()
-                .map(|item| QueryResultDto {
-                    path: item.path,
-                    is_directory: item.is_directory,
-                })
-                .collect(),
-        );
+        let mut response = QueryResponse::from_results(took_ms, total_entries, results);
+        response.metrics = Some(snapshot_metrics(&metrics, total_entries));
 
         serde_json::to_writer(&mut stream, &response).context("failed to serialize response")?;
         stream
@@ -805,14 +1117,15 @@ fn handle_pipe_client(
 
 fn run_metrics_reporter(
     metrics: Arc<Mutex<ServiceMetrics>>,
-    indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
+    service_state: Arc<ServiceState>,
     running: Arc<AtomicBool>,
     interval: Duration,
     logger: SharedLog,
 ) {
     while running.load(Ordering::SeqCst) {
         thread::sleep(interval);
-        let entries = indexes
+        let entries = service_state
+            .snapshot_indexes()
             .iter()
             .map(|index| match index.read() {
                 Ok(guard) => guard.entries.len(),
@@ -849,6 +1162,41 @@ fn run_metrics_reporter(
                 snapshot.requests_total, snapshot.last_took_ms, snapshot.max_took_ms
             ),
         );
+    }
+}
+
+fn snapshot_metrics(
+    metrics: &Arc<Mutex<ServiceMetrics>>,
+    indexed_entries: usize,
+) -> QueryMetricsDto {
+    let snapshot = match metrics.lock() {
+        Ok(guard) => ServiceMetrics {
+            requests_total: guard.requests_total,
+            total_took_ms: guard.total_took_ms,
+            last_took_ms: guard.last_took_ms,
+            max_took_ms: guard.max_took_ms,
+        },
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            ServiceMetrics {
+                requests_total: guard.requests_total,
+                total_took_ms: guard.total_took_ms,
+                last_took_ms: guard.last_took_ms,
+                max_took_ms: guard.max_took_ms,
+            }
+        }
+    };
+    let avg_took_ms = if snapshot.requests_total == 0 {
+        0.0
+    } else {
+        snapshot.total_took_ms as f64 / snapshot.requests_total as f64
+    };
+    QueryMetricsDto {
+        requests_total: snapshot.requests_total,
+        avg_took_ms,
+        last_took_ms: snapshot.last_took_ms,
+        max_took_ms: snapshot.max_took_ms,
+        indexed_entries,
     }
 }
 

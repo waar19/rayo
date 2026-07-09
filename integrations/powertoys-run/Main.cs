@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
 using Wox.Plugin;
@@ -13,6 +15,9 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
     private const string ServiceProcessName = "rayo-service";
     private const string ServiceExecutableName = "rayo-service.exe";
     private const string ServicePathEnvironmentVariable = "RAYO_SERVICE_PATH";
+    private const string PluginVersion = "0.4.0";
+    private const string ReleasesLatestApi = "https://api.github.com/repos/waar19/rayo/releases/latest";
+    private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(4) };
 
     public string Name => "Rayo";
 
@@ -20,10 +25,12 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 
     private readonly RayoPipeClient _pipeClient = new();
     private PluginInitContext? _pluginContext;
+    private bool _updateCheckStarted;
 
     public void Init(PluginInitContext context)
     {
         _pluginContext = context;
+        StartUpdateCheck();
     }
 
     public List<Result> Query(Query query)
@@ -35,6 +42,12 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
     {
         var isGlobalQuery = string.IsNullOrWhiteSpace(query?.ActionKeyword);
         var input = query?.Search?.Trim() ?? string.Empty;
+        var mode = "name";
+        if (!isGlobalQuery && input.StartsWith("c ", StringComparison.OrdinalIgnoreCase))
+        {
+            mode = "content";
+            input = input[2..].Trim();
+        }
         if (string.IsNullOrWhiteSpace(input))
         {
             return [];
@@ -54,7 +67,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         try
         {
             var response = _pipeClient
-                .QueryAsync(input, limit: 20)
+                .QueryAsync(input, limit: 20, mode: mode, timeoutMs: mode == "content" ? 3_000 : null)
                 .GetAwaiter()
                 .GetResult();
             if (response is null)
@@ -84,7 +97,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
                 mapped.Add(new Result
                 {
                     Title = title,
-                    SubTitle = item.Path,
+                    SubTitle = FormatSubTitle(item),
                     Score = scoreBase - idx,
                     IcoPath = item.IsDirectory ? "Images\\rayo.folder.png" : "Images\\rayo.file.png",
                     ContextData = item,
@@ -113,6 +126,16 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             }
             return isGlobalQuery ? [] : [BuildServiceNotRunningResult()];
         }
+    }
+
+    private static string FormatSubTitle(QueryResultItem item)
+    {
+        if (item.LineNumber is > 0)
+        {
+            var excerpt = string.IsNullOrWhiteSpace(item.LineText) ? string.Empty : $"  {item.LineText.Trim()}";
+            return $"{item.Path}:{item.LineNumber}{excerpt}";
+        }
+        return item.Path;
     }
 
     public List<ContextMenuResult> LoadContextMenus(Result selectedResult)
@@ -393,5 +416,117 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         var expanded = Environment.ExpandEnvironmentVariables(rawPath.Trim());
         var withoutQuotes = expanded.Trim('"');
         return string.IsNullOrWhiteSpace(withoutQuotes) ? null : withoutQuotes;
+    }
+
+    private void StartUpdateCheck()
+    {
+        if (_updateCheckStarted)
+        {
+            return;
+        }
+        _updateCheckStarted = true;
+        _ = Task.Run(CheckForUpdatesAsync);
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        try
+        {
+            var statePath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Rayo",
+                "plugin-update-check.json"
+            );
+            var stateDir = Path.GetDirectoryName(statePath);
+            if (!string.IsNullOrWhiteSpace(stateDir))
+            {
+                Directory.CreateDirectory(stateDir);
+            }
+
+            var now = DateTimeOffset.UtcNow;
+            var state = await LoadUpdateStateAsync(statePath).ConfigureAwait(false);
+            if (state.CheckedAt > now.AddHours(-24) && !string.IsNullOrWhiteSpace(state.LatestVersion))
+            {
+                if (IsVersionNewer(state.LatestVersion!, PluginVersion))
+                {
+                    ShowStatus($"New Rayo version available ({state.LatestVersion}). Run installer to update.");
+                }
+                return;
+            }
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, ReleasesLatestApi);
+            request.Headers.TryAddWithoutValidation("User-Agent", "rayo-powertoys-plugin");
+            using var response = await UpdateHttpClient.SendAsync(request).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return;
+            }
+            var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            using var json = JsonDocument.Parse(body);
+            if (!json.RootElement.TryGetProperty("tag_name", out var tagProperty))
+            {
+                return;
+            }
+
+            var latest = (tagProperty.GetString() ?? string.Empty).Trim().TrimStart('v', 'V');
+            if (string.IsNullOrWhiteSpace(latest))
+            {
+                return;
+            }
+
+            var nextState = new UpdateState { CheckedAt = now, LatestVersion = latest };
+            await SaveUpdateStateAsync(statePath, nextState).ConfigureAwait(false);
+            if (IsVersionNewer(latest, PluginVersion))
+            {
+                ShowStatus($"New Rayo version available ({latest}). Run installer to update.");
+            }
+        }
+        catch
+        {
+            // Ignore update-check failures to avoid impacting searches.
+        }
+    }
+
+    private static bool IsVersionNewer(string latest, string current)
+    {
+        static Version ParseVersion(string value)
+        {
+            return Version.TryParse(value.Trim().TrimStart('v', 'V'), out var parsed)
+                ? parsed
+                : new Version(0, 0);
+        }
+
+        return ParseVersion(latest) > ParseVersion(current);
+    }
+
+    private static async Task<UpdateState> LoadUpdateStateAsync(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return new UpdateState { CheckedAt = DateTimeOffset.MinValue, LatestVersion = null };
+        }
+
+        try
+        {
+            var json = await File.ReadAllTextAsync(path).ConfigureAwait(false);
+            return JsonSerializer.Deserialize<UpdateState>(json)
+                ?? new UpdateState { CheckedAt = DateTimeOffset.MinValue, LatestVersion = null };
+        }
+        catch
+        {
+            return new UpdateState { CheckedAt = DateTimeOffset.MinValue, LatestVersion = null };
+        }
+    }
+
+    private static Task SaveUpdateStateAsync(string path, UpdateState state)
+    {
+        var content = JsonSerializer.Serialize(state);
+        return File.WriteAllTextAsync(path, content);
+    }
+
+    private sealed class UpdateState
+    {
+        public DateTimeOffset CheckedAt { get; set; }
+        public string? LatestVersion { get; set; }
     }
 }

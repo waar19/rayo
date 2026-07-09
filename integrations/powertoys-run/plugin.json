@@ -4,7 +4,7 @@
   "IsGlobal": true,
   "Name": "Rayo",
   "Author": "waar19",
-  "Version": "0.1.8",
+  "Version": "0.4.0",
   "Language": "csharp",
   "Website": "https://github.com/waar19/rayo",
   "ExecuteFileName": "Community.PowerToys.Run.Plugin.Rayo.dll",

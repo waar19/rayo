@@ -22,8 +22,8 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 
 - `crates/rayo-core`: indexado, búsqueda, integración NTFS/USN, persistencia.
 - `crates/rayo-cli`: interfaz CLI (`index`, `search`, `content`, `watch`).
-- `crates/rayo-service`: servicio de fondo elevado con índice en memoria y API por named pipe.
-- `crates/rayo-gui`: GUI nativa (`Slint`, estilo Fluent) con búsqueda por servicio o fallback local.
+- `crates/rayo-service`: servicio de fondo elevado con índice en memoria, búsqueda por contenido y API por named pipe.
+- `crates/rayo-gui`: GUI nativa (`Slint`, estilo Fluent) con búsqueda por servicio/fallback, modo contenido, modo fuzzy, hotkey y panel de preview.
 
 ## Requisitos
 
@@ -45,6 +45,8 @@ cargo run -p rayo-cli -- index --drive C,D --output .\c.rayo
 
 # Buscar
 cargo run -p rayo-cli -- search --index .\c.rayo --query report --ext pdf
+# Ranking fuzzy
+cargo run -p rayo-cli -- search --index .\c.rayo --query rpt --fuzzy
 
 # Búsqueda de contenido (regex, estilo ripgrep)
 cargo run -p rayo-cli -- content --query "Rayo GUI search client" --under . --limit 20
@@ -53,8 +55,8 @@ cargo run -p rayo-cli -- content --query "Rayo GUI search client" --under . --li
 cargo run -p rayo-cli -- watch --drive C --index .\c.rayo
 
 # Levantar servicio de fondo (terminal como Administrador)
-# Una unidad:
-cargo run -p rayo-service -- --drive C --index .\c.rayo
+# Auto-detectar unidades NTFS fijas:
+cargo run -p rayo-service -- --drives auto --index .\index.rayo
 # Multi-unidad con merge:
 cargo run -p rayo-service -- --drives C,D --index .\c.rayo
 
@@ -71,9 +73,11 @@ cargo run -p rayo-cli -- shell doctor --gui-path .\target\debug\rayo-gui.exe
 ### Acciones de GUI
 
 - Selecciona una fila y usa botones: `Open`, `Open as admin`, `Open folder`, `Copy path`.
-- Panel de Settings integrado para ajustar alcance, extensión, modo, límite y debounce.
+- Panel de Settings integrado para ajustar alcance, extensión, modo nombre/contenido, modo fuzzy, límite y debounce.
 - Atajos de teclado: `Ctrl+,` abre Settings y `Esc` cierra Settings.
+- Hotkey global: `Ctrl+Alt+Espacio` enfoca ventana de Rayo.
 - Consultas vacías o de 1 caracter no disparan búsqueda completa salvo que uses `--under`.
+- Click derecho sobre resultado abre menú contextual de acciones.
 
 ### Flags contextuales de GUI
 
@@ -151,7 +155,7 @@ Esto genera `dist/rayo-windows.zip` con `rayo-cli.exe`, `rayo-service.exe`, `ray
 ## Plugin de PowerToys Run
 
 - Proyecto del plugin: [`integrations/powertoys-run`](integrations/powertoys-run)
-- Keyword de activación: `ry`
+- Keyword de activación: `ry` (también puedes usar modo global en PowerToys)
 - Dependencia en runtime: `rayo-service` corriendo como Administrador (`\\.\pipe\rayo-query`)
 
 ### Build e instalación manual
@@ -168,6 +172,10 @@ Copia salida del plugin a:
 Luego reinicia PowerToys y busca con:
 
 `ry <consulta>`
+
+Modo contenido desde plugin:
+
+`ry c <regex>`
 
 ### Ejecutar como servicio en segundo plano (recomendado)
 
@@ -210,7 +218,7 @@ Qué hace:
 
 - Log del servicio en vivo: `%ProgramData%\Rayo\service.log`
 - El plugin de PowerToys muestra progreso de inicio/indexación mientras el servicio calienta.
-- La barra de estado de la GUI muestra origen y total indexado (ejemplo: `service | indexed=...`).
+- La barra de estado de la GUI muestra origen, total indexado, número de requests y latencia promedio.
 
 ```powershell
 Get-Content C:\ProgramData\Rayo\service.log -Tail 20 -Wait
@@ -236,13 +244,20 @@ pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
 - Workflow por tag publica:
   - `rayo-windows.zip`
   - `RayoPlugin.zip`
+  - `rayo-winget-manifest-<versión>.zip`
 - Instalador descarga `RayoPlugin.zip` del último release automáticamente cuando no recibe `-PluginZipPath`.
+
+Generar paquete de manifiesto Winget local:
+
+```powershell
+pwsh .\scripts\generate-winget-manifest.ps1 -Version 0.3.0 -InstallerUrl "https://github.com/waar19/rayo/releases/download/v0.3.0/rayo-windows.zip" -InstallerPath .\dist\rayo-windows.zip
+```
 
 ### Solución de errores de inicialización en PowerToys
 
 Si PowerToys muestra error al iniciar plugin Rayo:
 
-1. Verifica que usas último release (`v0.1.7` o superior).
+1. Verifica que usas último release (`v0.4.0` o superior).
 2. Reinstala plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex

@@ -388,6 +388,7 @@ impl FileIndex {
 
     pub fn search(&self, options: &SearchOptions) -> Vec<SearchResult> {
         let normalized_query = options.query.to_ascii_lowercase();
+        let fuzzy_mode = options.fuzzy && !normalized_query.trim().is_empty();
         let limit = options.limit.max(1);
         let candidate_limit = limit.saturating_mul(8).max(limit);
         let ext = options
@@ -403,8 +404,11 @@ impl FileIndex {
             .as_ref()
             .and_then(|pattern| build_glob(pattern).ok());
 
-        let trigram_candidate_limit = candidate_limit.saturating_mul(32).max(candidate_limit);
-        let candidate_frns =
+        let candidate_frns = if fuzzy_mode {
+            let fuzzy_candidate_limit = limit.saturating_mul(500).clamp(limit, 200_000);
+            self.search_arena.candidate_frns("", fuzzy_candidate_limit)
+        } else {
+            let trigram_candidate_limit = candidate_limit.saturating_mul(32).max(candidate_limit);
             if options.prefer_trigram && normalized_query.len() >= TRIGRAM_MIN_QUERY_LEN {
                 if let Some(trigram) = &self.trigram_index {
                     trigram.query_candidates(&normalized_query, trigram_candidate_limit)
@@ -415,9 +419,11 @@ impl FileIndex {
             } else {
                 self.search_arena
                     .candidate_frns(&normalized_query, candidate_limit)
-            };
+            }
+        };
 
         let mut results = Vec::new();
+        let mut fuzzy_ranked = Vec::new();
         for frn in candidate_frns {
             let Some(entry) = self.entries.get(&frn) else {
                 continue;
@@ -456,16 +462,32 @@ impl FileIndex {
                     continue;
                 }
             }
-
-            results.push(SearchResult {
+            let result = SearchResult {
                 frn: entry.frn,
                 path,
                 is_directory: entry.is_directory(),
-            });
+            };
+            if fuzzy_mode {
+                let Some(score) = fuzzy_relevance_score(&result.path, &normalized_query) else {
+                    continue;
+                };
+                fuzzy_ranked.push((score, result));
+            } else {
+                results.push(result);
+            }
         }
 
-        // Sort only the small candidate set by perceived relevance.
-        results.sort_by(|a, b| compare_relevance(a, b, &normalized_query));
+        if fuzzy_mode {
+            fuzzy_ranked.sort_by(|(score_a, result_a), (score_b, result_b)| {
+                score_a
+                    .cmp(score_b)
+                    .then_with(|| result_a.path.cmp(&result_b.path))
+            });
+            results = fuzzy_ranked.into_iter().map(|(_, result)| result).collect();
+        } else {
+            // Sort only the small candidate set by perceived relevance.
+            results.sort_by(|a, b| compare_relevance(a, b, &normalized_query));
+        }
         if results.len() > limit {
             results.truncate(limit);
         }
@@ -527,6 +549,70 @@ fn relevance_key(result: &SearchResult, query_lower: &str) -> (u8, usize, usize)
     (starts_with, match_pos, result.path.len())
 }
 
+fn fuzzy_relevance_score(path: &str, query_lower: &str) -> Option<usize> {
+    let file_name = path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let file_score = fuzzy_subsequence_score(&file_name, query_lower);
+    let path_score = fuzzy_subsequence_score(&path_lower, query_lower);
+    match (file_score, path_score) {
+        (Some(file_score), Some(path_score)) => Some(file_score.saturating_mul(2) + path_score),
+        (Some(file_score), None) => Some(file_score.saturating_mul(3)),
+        (None, Some(path_score)) => Some(path_score.saturating_add(200)),
+        (None, None) => None,
+    }
+}
+
+fn fuzzy_subsequence_score(haystack: &str, query_lower: &str) -> Option<usize> {
+    if query_lower.is_empty() {
+        return Some(0);
+    }
+    let haystack_bytes = haystack.as_bytes();
+    let query_bytes = query_lower.as_bytes();
+    let mut cursor = 0usize;
+    let mut previous_index: Option<usize> = None;
+    let mut score = 0usize;
+
+    for needle in query_bytes {
+        let mut found = None;
+        while cursor < haystack_bytes.len() {
+            if haystack_bytes[cursor] == *needle {
+                found = Some(cursor);
+                cursor += 1;
+                break;
+            }
+            cursor += 1;
+        }
+        let index = found?;
+
+        if let Some(prev) = previous_index {
+            let gap = index.saturating_sub(prev.saturating_add(1));
+            score = score.saturating_add(gap.saturating_mul(2));
+            if index == prev.saturating_add(1) {
+                score = score.saturating_sub(1);
+            }
+        } else {
+            score = score.saturating_add(index);
+        }
+
+        if index == 0 {
+            score = score.saturating_sub(3);
+        } else if let Some(separator) = haystack_bytes.get(index - 1)
+            && matches!(*separator, b'\\' | b'/' | b'_' | b'-' | b' ' | b'.')
+        {
+            score = score.saturating_sub(2);
+        }
+
+        previous_index = Some(index);
+    }
+
+    score = score.saturating_add(haystack_bytes.len().saturating_sub(query_bytes.len()));
+    Some(score)
+}
+
 #[derive(Debug, Clone)]
 struct UnderMatcher {
     exact: String,
@@ -567,6 +653,7 @@ pub struct SearchOptions {
     pub files_only: bool,
     pub limit: usize,
     pub prefer_trigram: bool,
+    pub fuzzy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -698,6 +785,7 @@ mod tests {
             files_only: true,
             limit: 10,
             prefer_trigram: false,
+            fuzzy: false,
         });
 
         assert_eq!(results.len(), 1);
@@ -809,6 +897,7 @@ mod tests {
             files_only: true,
             limit: 10,
             prefer_trigram: false,
+            fuzzy: false,
         });
 
         assert_eq!(results.len(), 1);
@@ -867,6 +956,7 @@ mod tests {
             files_only: true,
             limit: 10,
             prefer_trigram: true,
+            fuzzy: false,
         });
 
         assert_eq!(results.len(), 1);
