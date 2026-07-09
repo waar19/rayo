@@ -83,6 +83,10 @@ public sealed class QueryResponse
     public int TotalEntries { get; set; }
 
     public List<QueryResultItem> Results { get; set; } = [];
+
+    public string? Status { get; set; }
+
+    public int? IndexedEntries { get; set; }
 }
 
 public sealed class QueryResultItem

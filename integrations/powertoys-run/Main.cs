@@ -10,6 +10,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 {
     public static string PluginID => "F8074EA2F6CF4A3A8D996BBA5F95F185";
     private const string BackgroundTaskName = "Rayo Service";
+    private const string ServiceProcessName = "rayo-service";
     private const string ServiceExecutableName = "rayo-service.exe";
     private const string ServicePathEnvironmentVariable = "RAYO_SERVICE_PATH";
 
@@ -44,6 +45,14 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
                 .QueryAsync(input, limit: 20)
                 .GetAwaiter()
                 .GetResult();
+            if (response is null)
+            {
+                return [];
+            }
+            if (string.Equals(response.Status, "starting", StringComparison.OrdinalIgnoreCase))
+            {
+                return [BuildServiceStartingResult(response.IndexedEntries)];
+            }
             if (response?.Results is null || response.Results.Count == 0)
             {
                 return [];
@@ -79,19 +88,17 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 
             return mapped;
         }
+        catch (TimeoutException) when (IsServiceProcessRunning())
+        {
+            return [BuildServiceStartingResult(indexedEntries: null)];
+        }
         catch (Exception)
         {
-            return
-            [
-                new Result
-                {
-                    Title = "Rayo service not running",
-                    SubTitle = "Press Enter to start rayo-service as administrator.",
-                    Score = int.MaxValue,
-                    IcoPath = "Images\\rayo.warn.png",
-                    Action = _ => TryStartService(),
-                },
-            ];
+            if (IsServiceProcessRunning())
+            {
+                return [BuildServiceStartingResult(indexedEntries: null)];
+            }
+            return [BuildServiceNotRunningResult()];
         }
     }
 
@@ -236,6 +243,45 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         catch
         {
             ShowStatus("Could not start rayo-service. Confirm UAC and try again.");
+            return false;
+        }
+    }
+
+    private Result BuildServiceNotRunningResult()
+    {
+        return new Result
+        {
+            Title = "Rayo service not running",
+            SubTitle = "Press Enter to start rayo-service as administrator.",
+            Score = int.MaxValue,
+            IcoPath = "Images\\rayo.warn.png",
+            Action = _ => TryStartService(),
+        };
+    }
+
+    private static Result BuildServiceStartingResult(int? indexedEntries)
+    {
+        var subtitle = indexedEntries is > 0
+            ? $"Rayo is indexing in the background ({indexedEntries:N0} entries scanned). Retry in a few seconds."
+            : "Rayo is starting in the background. Retry in a few seconds.";
+        return new Result
+        {
+            Title = "Rayo is starting",
+            SubTitle = subtitle,
+            Score = int.MaxValue,
+            IcoPath = "Images\\rayo.warn.png",
+            Action = _ => false,
+        };
+    }
+
+    private static bool IsServiceProcessRunning()
+    {
+        try
+        {
+            return Process.GetProcessesByName(ServiceProcessName).Length > 0;
+        }
+        catch
+        {
             return false;
         }
     }

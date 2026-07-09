@@ -19,7 +19,9 @@ use rayo_core::{
     FileIndex, SearchOptions, is_running_as_admin, load_index, normalize_drive, save_index,
 };
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE, SYSTEMTIME,
+};
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -29,6 +31,7 @@ use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE,
     PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::core::{HRESULT, PCWSTR};
 
 const PIPE_NAME: &str = r"\\.\pipe\rayo-query";
@@ -86,6 +89,32 @@ struct QueryResponse {
     took_ms: u128,
     total_entries: usize,
     results: Vec<QueryResultDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexed_entries: Option<usize>,
+}
+
+impl QueryResponse {
+    fn from_results(took_ms: u128, total_entries: usize, results: Vec<QueryResultDto>) -> Self {
+        Self {
+            took_ms,
+            total_entries,
+            results,
+            status: None,
+            indexed_entries: None,
+        }
+    }
+
+    fn starting(indexed_entries: usize) -> Self {
+        Self {
+            took_ms: 0,
+            total_entries: indexed_entries,
+            results: Vec::new(),
+            status: Some("starting"),
+            indexed_entries: Some(indexed_entries),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -96,6 +125,31 @@ struct ServiceMetrics {
     max_took_ms: u128,
 }
 
+#[derive(Default)]
+struct ServiceState {
+    indexes: RwLock<Vec<Arc<RwLock<FileIndex>>>>,
+    ready: AtomicBool,
+    indexed_entries: AtomicUsize,
+}
+
+impl ServiceState {
+    fn update_indexes(&self, indexes: Vec<Arc<RwLock<FileIndex>>>) {
+        let mut guard = match self.indexes.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = indexes;
+    }
+
+    fn snapshot_indexes(&self) -> Vec<Arc<RwLock<FileIndex>>> {
+        let guard = match self.indexes.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    }
+}
+
 #[derive(Clone)]
 struct DriveState {
     drive: String,
@@ -104,6 +158,11 @@ struct DriveState {
 }
 
 type SharedLog = Arc<Mutex<File>>;
+
+struct BootstrapIndex {
+    index: FileIndex,
+    built_from_scratch: bool,
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -117,13 +176,46 @@ fn main() -> Result<()> {
     );
     let index_base = cli.index.clone();
     let multi_drive = drives.len() > 1;
+    let service_state = Arc::new(ServiceState::default());
+    let metrics = Arc::new(Mutex::new(ServiceMetrics::default()));
+    let running = Arc::new(AtomicBool::new(true));
+    let running_handler = running.clone();
+    ctrlc::set_handler(move || {
+        running_handler.store(false, Ordering::SeqCst);
+    })
+    .context("failed to install Ctrl+C handler")?;
+
+    log_info(&logger, format!("Named pipe listening on {PIPE_NAME}"));
+    let pipe_running = running.clone();
+    let pipe_state = service_state.clone();
+    let pipe_metrics = metrics.clone();
+    let pipe_logger = logger.clone();
+    let pipe_default_limit = cli.default_limit.max(1);
+    let pipe_thread = thread::spawn(move || {
+        run_pipe_server(
+            pipe_state,
+            pipe_running,
+            pipe_metrics,
+            pipe_default_limit,
+            pipe_logger,
+        )
+    });
+
     let mut drive_states = Vec::with_capacity(drives.len());
+    let mut indexed_entries_accumulated = 0usize;
     for drive in drives {
         let index_path = match &index_base {
             Some(base) => drive_index_path(base, &drive, multi_drive),
             None => default_background_index_path_for_drive(&drive),
         };
-        let mut index = load_or_build_index(&drive, &index_path, &logger)?;
+        let bootstrap = load_or_build_index(
+            &drive,
+            &index_path,
+            &logger,
+            service_state.clone(),
+            indexed_entries_accumulated,
+        )?;
+        let mut index = bootstrap.index;
         if cli.trigram {
             let trigram_started = Instant::now();
             index.set_trigram_enabled(true);
@@ -136,9 +228,15 @@ fn main() -> Result<()> {
                 ),
             );
         }
-        save_index(&index, &index_path).with_context(|| {
-            format!("failed to save bootstrap index at {}", index_path.display())
-        })?;
+        if bootstrap.built_from_scratch {
+            save_index(&index, &index_path).with_context(|| {
+                format!("failed to save bootstrap index at {}", index_path.display())
+            })?;
+        }
+        indexed_entries_accumulated += index.entries.len();
+        service_state
+            .indexed_entries
+            .store(indexed_entries_accumulated, Ordering::Relaxed);
         log_info(
             &logger,
             format!(
@@ -162,13 +260,8 @@ fn main() -> Result<()> {
             .map(|state| state.index.clone())
             .collect::<Vec<_>>(),
     );
-    let metrics = Arc::new(Mutex::new(ServiceMetrics::default()));
-    let running = Arc::new(AtomicBool::new(true));
-    let running_handler = running.clone();
-    ctrlc::set_handler(move || {
-        running_handler.store(false, Ordering::SeqCst);
-    })
-    .context("failed to install Ctrl+C handler")?;
+    service_state.update_indexes(indexes.as_ref().clone());
+    service_state.ready.store(true, Ordering::SeqCst);
 
     let watch_poll = cli.poll_ms.max(50);
     let watch_persist_every = cli.persist_every_changes.max(1);
@@ -210,14 +303,10 @@ fn main() -> Result<()> {
         );
     });
 
-    log_info(&logger, format!("Named pipe listening on {PIPE_NAME}"));
-    let pipe_result = run_pipe_server(
-        indexes,
-        running.clone(),
-        metrics,
-        cli.default_limit.max(1),
-        logger.clone(),
-    );
+    let pipe_result = match pipe_thread.join() {
+        Ok(result) => result,
+        Err(_) => Err(anyhow!("named pipe thread panicked")),
+    };
     running.store(false, Ordering::SeqCst);
     for handle in watch_threads {
         let _ = handle.join();
@@ -285,16 +374,28 @@ fn drive_index_path(base: &Path, drive: &str, multi_drive: bool) -> PathBuf {
     base.with_file_name(file_name)
 }
 
-fn load_or_build_index(drive: &str, index_path: &PathBuf, logger: &SharedLog) -> Result<FileIndex> {
+fn load_or_build_index(
+    drive: &str,
+    index_path: &PathBuf,
+    logger: &SharedLog,
+    service_state: Arc<ServiceState>,
+    progress_offset: usize,
+) -> Result<BootstrapIndex> {
     if index_path.exists() {
         let loaded = load_index(index_path)
             .with_context(|| format!("failed to read {}", index_path.display()))?;
         if loaded.drive.eq_ignore_ascii_case(drive) {
+            service_state
+                .indexed_entries
+                .store(progress_offset + loaded.entries.len(), Ordering::Relaxed);
             log_info(
                 logger,
                 format!("Loaded existing index from {}", index_path.display()),
             );
-            return Ok(loaded);
+            return Ok(BootstrapIndex {
+                index: loaded,
+                built_from_scratch: false,
+            });
         }
         log_info(
             logger,
@@ -315,7 +416,7 @@ fn load_or_build_index(drive: &str, index_path: &PathBuf, logger: &SharedLog) ->
     }
 
     let started = Instant::now();
-    let index = build_index_with_progress(drive, logger)?;
+    let index = build_index_with_progress(drive, logger, Some(service_state), progress_offset)?;
     log_info(
         logger,
         format!(
@@ -324,16 +425,25 @@ fn load_or_build_index(drive: &str, index_path: &PathBuf, logger: &SharedLog) ->
             started.elapsed()
         ),
     );
-    Ok(index)
+    Ok(BootstrapIndex {
+        index,
+        built_from_scratch: true,
+    })
 }
 
-fn build_index_with_progress(drive: &str, logger: &SharedLog) -> Result<FileIndex> {
+fn build_index_with_progress(
+    drive: &str,
+    logger: &SharedLog,
+    service_state: Option<Arc<ServiceState>>,
+    progress_offset: usize,
+) -> Result<FileIndex> {
     let progress = Arc::new(AtomicUsize::new(0));
     let monitor_running = Arc::new(AtomicBool::new(true));
     let monitor_progress = progress.clone();
     let monitor_flag = monitor_running.clone();
     let monitor_drive = drive.to_string();
     let monitor_logger = logger.clone();
+    let monitor_state = service_state.clone();
     let started = Instant::now();
 
     let monitor = thread::spawn(move || {
@@ -343,6 +453,11 @@ fn build_index_with_progress(drive: &str, logger: &SharedLog) -> Result<FileInde
                 break;
             }
             let scanned = monitor_progress.load(Ordering::Relaxed);
+            if let Some(state) = &monitor_state {
+                state
+                    .indexed_entries
+                    .store(progress_offset + scanned, Ordering::Relaxed);
+            }
             log_info(
                 &monitor_logger,
                 format!(
@@ -358,6 +473,15 @@ fn build_index_with_progress(drive: &str, logger: &SharedLog) -> Result<FileInde
     let result = FileIndex::build_with_progress(drive, Some(progress.as_ref()));
     monitor_running.store(false, Ordering::SeqCst);
     let _ = monitor.join();
+    if let Some(state) = service_state {
+        let final_entries = result
+            .as_ref()
+            .map(|index| index.entries.len())
+            .unwrap_or_else(|_| progress.load(Ordering::Relaxed));
+        state
+            .indexed_entries
+            .store(progress_offset + final_entries, Ordering::Relaxed);
+    }
     result
 }
 
@@ -391,17 +515,32 @@ fn open_log_writer(path: &Path) -> Result<SharedLog> {
 }
 
 fn log_info(logger: &SharedLog, message: String) {
-    println!("{message}");
+    let line = format!("{} {message}", current_timestamp());
+    println!("{line}");
     if let Ok(mut file) = logger.lock() {
-        let _ = writeln!(file, "{message}");
+        let _ = writeln!(file, "{line}");
     }
 }
 
 fn log_error(logger: &SharedLog, message: String) {
-    eprintln!("{message}");
+    let line = format!("{} {message}", current_timestamp());
+    eprintln!("{line}");
     if let Ok(mut file) = logger.lock() {
-        let _ = writeln!(file, "{message}");
+        let _ = writeln!(file, "{line}");
     }
+}
+
+fn current_timestamp() -> String {
+    let local_time: SYSTEMTIME = unsafe { GetLocalTime() };
+    format!(
+        "[{:04}-{:02}-{:02} {:02}:{:02}:{:02}]",
+        local_time.wYear,
+        local_time.wMonth,
+        local_time.wDay,
+        local_time.wHour,
+        local_time.wMinute,
+        local_time.wSecond
+    )
 }
 
 fn run_watch_loop(
@@ -468,7 +607,7 @@ fn run_watch_loop(
 }
 
 fn run_pipe_server(
-    indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
+    service_state: Arc<ServiceState>,
     running: Arc<AtomicBool>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
@@ -486,7 +625,7 @@ fn run_pipe_server(
             }
         }
 
-        let shared_indexes = indexes.clone();
+        let shared_state = service_state.clone();
         let shared_metrics = metrics.clone();
         let shared_logger = logger.clone();
         let pipe_raw = pipe.0 as isize;
@@ -494,7 +633,7 @@ fn run_pipe_server(
             let pipe = HANDLE(pipe_raw as *mut c_void);
             if let Err(err) = handle_pipe_client(
                 pipe,
-                shared_indexes,
+                shared_state,
                 shared_metrics,
                 default_limit,
                 shared_logger.clone(),
@@ -555,7 +694,7 @@ fn pipe_security_attributes() -> Result<SECURITY_ATTRIBUTES> {
 
 fn handle_pipe_client(
     pipe: HANDLE,
-    indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
+    service_state: Arc<ServiceState>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
     _logger: SharedLog,
@@ -591,6 +730,33 @@ fn handle_pipe_client(
             prefer_trigram: false,
         };
 
+        if !service_state.ready.load(Ordering::SeqCst) {
+            let response =
+                QueryResponse::starting(service_state.indexed_entries.load(Ordering::Relaxed));
+            serde_json::to_writer(&mut stream, &response)
+                .context("failed to serialize startup response")?;
+            stream
+                .write_all(b"\n")
+                .context("failed to write startup response terminator")?;
+            stream.flush().context("failed to flush startup response")?;
+            continue;
+        }
+
+        let indexes = service_state.snapshot_indexes();
+        if indexes.is_empty() {
+            let response =
+                QueryResponse::starting(service_state.indexed_entries.load(Ordering::Relaxed));
+            serde_json::to_writer(&mut stream, &response)
+                .context("failed to serialize empty-index startup response")?;
+            stream
+                .write_all(b"\n")
+                .context("failed to write empty-index startup response terminator")?;
+            stream
+                .flush()
+                .context("failed to flush empty-index startup response")?;
+            continue;
+        }
+
         let started = Instant::now();
         let query_lower = options.query.to_ascii_lowercase();
         let mut total_entries = 0usize;
@@ -616,17 +782,17 @@ fn handle_pipe_client(
             guard.last_took_ms = took_ms;
             guard.max_took_ms = guard.max_took_ms.max(took_ms);
         }
-        let response = QueryResponse {
+        let response = QueryResponse::from_results(
             took_ms,
             total_entries,
-            results: merged
+            merged
                 .into_iter()
                 .map(|item| QueryResultDto {
                     path: item.path,
                     is_directory: item.is_directory,
                 })
                 .collect(),
-        };
+        );
 
         serde_json::to_writer(&mut stream, &response).context("failed to serialize response")?;
         stream
