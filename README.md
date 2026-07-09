@@ -205,6 +205,21 @@ What it does:
 - Registers/starts scheduled task `Rayo Service` for true background startup.
 - Supports `RAYO_SERVICE_PATH` as override for custom service location.
 
+### Uninstall plugin and service
+
+One-command uninstall:
+
+```powershell
+irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/uninstall-powertoys-plugin.ps1 | iex
+```
+
+By default, uninstall keeps existing indexes/logs in `%ProgramData%\Rayo`.
+To remove all data too:
+
+```powershell
+pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
+```
+
 ### Release assets
 
 - Tag-based release workflow publishes:

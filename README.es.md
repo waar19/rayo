@@ -205,6 +205,21 @@ Qué hace:
 - Registra/inicia la tarea programada `Rayo Service` para arranque real en segundo plano.
 - Soporta `RAYO_SERVICE_PATH` como override para ubicación personalizada del servicio.
 
+### Desinstalar plugin y servicio
+
+Desinstalación en un comando:
+
+```powershell
+irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/uninstall-powertoys-plugin.ps1 | iex
+```
+
+Por defecto, la desinstalación conserva índices/logs en `%ProgramData%\Rayo`.
+Para borrar también los datos:
+
+```powershell
+pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
+```
+
 ### Assets de release
 
 - Workflow por tag publica:
