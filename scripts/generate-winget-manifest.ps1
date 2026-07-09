@@ -35,7 +35,12 @@ Publisher: $Publisher
 PackageName: $PackageName
 License: MIT
 ShortDescription: Ultra-fast NTFS file search for Windows.
-Homepage: https://github.com/waar19/rayo
+PackageUrl: https://github.com/waar19/rayo
+Moniker: rayo
+Tags:
+  - search
+  - ntfs
+  - everything
 ManifestType: defaultLocale
 ManifestVersion: 1.9.0
 "@

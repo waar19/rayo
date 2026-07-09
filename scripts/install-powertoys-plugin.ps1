@@ -216,37 +216,48 @@ $pluginRoot = Join-Path $env:LOCALAPPDATA "Microsoft/PowerToys/PowerToys Run/Plu
 $serviceRoot = Join-Path $env:LOCALAPPDATA "Rayo"
 $powerToysExe = Get-PowerToysExePath
 $hasPowerToys = $null -ne $powerToysExe
+$skipPluginInstall = $false
 
 if (-not $hasPowerToys) {
     Write-Warning "PowerToys not detected."
     if ($AutoInstallDependencies) {
         if (-not (Test-Command "winget")) {
-            throw "winget not found. Install PowerToys manually: https://github.com/microsoft/PowerToys/releases"
+            Write-Warning "winget not found, cannot auto-install PowerToys."
+        } else {
+            Write-Host "Installing PowerToys..."
+            try {
+                Install-WithWinget -Id "Microsoft.PowerToys"
+            } catch {
+                Write-Warning "PowerToys auto-install failed: $($_.Exception.Message)"
+            }
+            $powerToysExe = Get-PowerToysExePath
+            $hasPowerToys = $null -ne $powerToysExe
         }
-        Write-Host "Installing PowerToys..."
-        Install-WithWinget -Id "Microsoft.PowerToys"
-        $powerToysExe = Get-PowerToysExePath
-        $hasPowerToys = $null -ne $powerToysExe
     }
 }
 
 if (-not $hasPowerToys) {
-    throw "PowerToys still not detected. Install it, then rerun installer."
+    Write-Warning "PowerToys still not detected. Plugin files will be skipped; binaries/service install will continue."
+    $skipPluginInstall = $true
 }
 
-$powerToysWasRunning = Stop-PowerToysIfRunning -ShouldStop $RestartPowerToys
+$powerToysWasRunning = $false
+if (-not $skipPluginInstall) {
+    $powerToysWasRunning = Stop-PowerToysIfRunning -ShouldStop $RestartPowerToys
 
-if (Test-Path $pluginRoot) {
-    try {
-        Remove-PathWithRetry -Path $pluginRoot | Out-Null
-    } catch {
-        throw "Plugin directory is locked. Close PowerToys and rerun installer, or use -RestartPowerToys `$true."
+    if (Test-Path $pluginRoot) {
+        try {
+            Remove-PathWithRetry -Path $pluginRoot | Out-Null
+        } catch {
+            throw "Plugin directory is locked. Close PowerToys and rerun installer, or use -RestartPowerToys `$true."
+        }
     }
+    New-Item -ItemType Directory -Path $pluginRoot -Force | Out-Null
+    Expand-Archive -Path $PluginZipPath -DestinationPath $pluginRoot -Force
+    Write-Host "Rayo plugin installed at: $pluginRoot"
+} else {
+    Write-Host "Skipping PowerToys plugin installation."
 }
-New-Item -ItemType Directory -Path $pluginRoot -Force | Out-Null
-Expand-Archive -Path $PluginZipPath -DestinationPath $pluginRoot -Force
-
-Write-Host "Rayo plugin installed at: $pluginRoot"
 
 $serviceTempDir = Join-Path $env:TEMP "rayo-service-install"
 if (Test-Path $serviceTempDir) {
