@@ -369,6 +369,16 @@ fn parse_drive_list(raw: &str) -> Result<Vec<String>> {
     Ok(drives)
 }
 
+fn service_install_drives_arg(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_string());
+    }
+
+    let drives = parse_drive_list(trimmed)?;
+    Ok(drives.join(","))
+}
+
 fn drive_index_path(base: &Path, drive: &str, multi_drive: bool) -> PathBuf {
     if !multi_drive {
         return base.to_path_buf();
@@ -441,8 +451,7 @@ fn run_service_install(
         return Ok(());
     }
 
-    let drives = parse_drive_list(&drives_raw)?;
-    let drives_csv = drives.join(",");
+    let drives_csv = service_install_drives_arg(&drives_raw)?;
     let service_path = resolve_service_exe_path(service_exe)?;
     let index_base = index.unwrap_or_else(default_background_index_base_path);
     let log_path = log_file.unwrap_or_else(default_background_log_path);
@@ -758,7 +767,7 @@ fn resolve_gui_path(gui_path: Option<PathBuf>) -> Result<PathBuf> {
 mod tests {
     use std::path::Path;
 
-    use super::{drive_index_path, parse_drive_list};
+    use super::{drive_index_path, parse_drive_list, service_install_drives_arg};
 
     #[test]
     fn parse_drive_list_supports_csv_and_dedup() {
@@ -771,5 +780,13 @@ mod tests {
         let base = Path::new("c.rayo");
         assert_eq!(drive_index_path(base, "C:", true), Path::new("c.rayo"));
         assert_eq!(drive_index_path(base, "D:", true), Path::new("d.rayo"));
+    }
+
+    #[test]
+    fn service_install_drives_arg_accepts_auto_but_parse_drive_list_rejects_it() {
+        let value =
+            service_install_drives_arg(" auto ").expect("auto accepted for service install");
+        assert_eq!(value, "auto");
+        assert!(parse_drive_list("auto").is_err());
     }
 }

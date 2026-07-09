@@ -16,7 +16,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
     private const string ServiceProcessName = "rayo-service";
     private const string ServiceExecutableName = "rayo-service.exe";
     private const string ServicePathEnvironmentVariable = "RAYO_SERVICE_PATH";
-    private const string PluginVersion = "0.4.0";
+    private const string PluginVersion = "0.4.1";
     private const string ReleasesLatestApi = "https://api.github.com/repos/waar19/rayo/releases/latest";
     private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(4) };
     private static readonly TimeSpan AppCatalogTtl = TimeSpan.FromMinutes(10);
