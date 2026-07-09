@@ -49,10 +49,6 @@ Write-Host "Generating Winget manifests for $PackageIdentifier v$normalizedVersi
     -OutputRoot $OutputRoot `
     -InstallerType "inno"
 
-if ($LASTEXITCODE -ne 0) {
-    throw "Manifest generation failed with exit code $LASTEXITCODE."
-}
-
 $manifestDir = Join-Path $OutputRoot $normalizedVersion
 if (-not (Test-Path $manifestDir)) {
     throw "Generated manifest directory not found: $manifestDir"
