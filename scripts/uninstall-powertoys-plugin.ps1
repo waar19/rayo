@@ -94,6 +94,7 @@ function Remove-ProgramDataRayo {
 
 $pluginRoot = Join-Path $env:LOCALAPPDATA "Microsoft/PowerToys/PowerToys Run/Plugins/Rayo"
 $serviceRoot = Join-Path $env:LOCALAPPDATA "Rayo"
+$startMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Rayo.lnk"
 $guiSettingsPath = Join-Path $env:APPDATA "rayo/settings.json"
 $guiSettingsDir = Split-Path -Parent $guiSettingsPath
 $powerToysExe = Get-PowerToysExePath
@@ -102,6 +103,7 @@ $taskRemoved = $false
 $shellRemoved = $false
 $pluginRemoved = $false
 $binariesRemoved = $false
+$shortcutRemoved = $false
 $dataRemoved = $false
 
 $cliExe = Join-Path $serviceRoot "rayo-cli.exe"
@@ -146,6 +148,7 @@ $powerToysWasRunning = Stop-PowerToysIfRunning -ShouldStop $RestartPowerToys
 
 $pluginRemoved = Remove-PathWithRetry -Path $pluginRoot
 $binariesRemoved = Remove-PathWithRetry -Path $serviceRoot
+$shortcutRemoved = Remove-PathWithRetry -Path $startMenuShortcut
 
 if ($RemoveData) {
     Write-Host "Removing optional data files (ProgramData + GUI settings)"
@@ -182,6 +185,7 @@ Write-Host " - Scheduled task removed: $taskRemoved"
 Write-Host " - Explorer shell integration removed: $shellRemoved"
 Write-Host " - Plugin directory removed: $pluginRemoved"
 Write-Host " - Local Rayo binaries removed: $binariesRemoved"
+Write-Host " - Start menu shortcut removed: $shortcutRemoved"
 if ($RemoveData) {
     Write-Host " - ProgramData removed: $dataRemoved"
 }

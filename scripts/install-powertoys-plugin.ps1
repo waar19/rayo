@@ -97,6 +97,29 @@ function Copy-WithRetry {
     }
 }
 
+function Ensure-RayoStartMenuShortcut {
+    param(
+        [string]$GuiPath
+    )
+
+    if (-not (Test-Path $GuiPath)) {
+        Write-Warning "Rayo GUI binary not found at '$GuiPath'. Start menu shortcut was not created."
+        return $false
+    }
+
+    $startMenuPrograms = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
+    New-Item -ItemType Directory -Path $startMenuPrograms -Force | Out-Null
+    $shortcutPath = Join-Path $startMenuPrograms "Rayo.lnk"
+
+    $wshShell = New-Object -ComObject WScript.Shell
+    $shortcut = $wshShell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $GuiPath
+    $shortcut.WorkingDirectory = Split-Path -Parent $GuiPath
+    $shortcut.IconLocation = "$GuiPath,0"
+    $shortcut.Save()
+    return $true
+}
+
 function Get-ReleaseMetadata {
     param(
         [string]$Repo,
@@ -202,6 +225,7 @@ Expand-Archive -Path $WindowsBundleZipPath -DestinationPath $serviceTempDir -For
 
 $serviceSource = Join-Path $serviceTempDir "rayo-service.exe"
 $cliSource = Join-Path $serviceTempDir "rayo-cli.exe"
+$guiSource = Join-Path $serviceTempDir "rayo-gui.exe"
 if (-not (Test-Path $serviceSource)) {
     throw "rayo-service.exe not found in bundle: $WindowsBundleZipPath"
 }
@@ -213,8 +237,17 @@ New-Item -ItemType Directory -Path $serviceRoot -Force | Out-Null
 Stop-RayoServiceIfRunning -ServiceRootPath $serviceRoot
 Copy-WithRetry -Source $serviceSource -Destination (Join-Path $serviceRoot "rayo-service.exe")
 Copy-WithRetry -Source $cliSource -Destination (Join-Path $serviceRoot "rayo-cli.exe")
+if (Test-Path $guiSource) {
+    Copy-WithRetry -Source $guiSource -Destination (Join-Path $serviceRoot "rayo-gui.exe")
+} else {
+    Write-Warning "rayo-gui.exe not found in bundle. GUI launcher will not be installed."
+}
 Remove-Item -Recurse -Force $serviceTempDir
 Write-Host "Rayo binaries installed at: $serviceRoot"
+$guiShortcutCreated = Ensure-RayoStartMenuShortcut -GuiPath (Join-Path $serviceRoot "rayo-gui.exe")
+if ($guiShortcutCreated) {
+    Write-Host "Start menu shortcut created: Rayo"
+}
 
 if ($InstallBackgroundTask) {
     $cliExe = Join-Path $serviceRoot "rayo-cli.exe"
@@ -247,4 +280,5 @@ if ($RestartPowerToys) {
 }
 
 Write-Host "Done. Open PowerToys Run and use: ry <query>"
+Write-Host "You can also launch the GUI from Start menu: Rayo"
 Write-Host "If needed, set RAYO_SERVICE_PATH to override service binary location."

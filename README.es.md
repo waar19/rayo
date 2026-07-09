@@ -201,9 +201,20 @@ pwsh .\scripts\install-powertoys-plugin.ps1 -PluginZipPath .\dist\powertoys-run\
 Qué hace:
 - Detecta PowerToys.
 - Instala plugin en `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
-- Instala `rayo-service.exe` y `rayo-cli.exe` en `%LOCALAPPDATA%\Rayo\` para que Enter pueda iniciar el servicio desde PowerToys.
+- Instala `rayo-service.exe`, `rayo-cli.exe` y `rayo-gui.exe` en `%LOCALAPPDATA%\Rayo\`.
+- Crea el acceso directo `Rayo` en el menú Inicio para abrir la GUI.
 - Registra/inicia la tarea programada `Rayo Service` para arranque real en segundo plano.
 - Soporta `RAYO_SERVICE_PATH` como override para ubicación personalizada del servicio.
+
+### Ver estado de indexación
+
+- Log del servicio en vivo: `%ProgramData%\Rayo\service.log`
+- El plugin de PowerToys muestra progreso de inicio/indexación mientras el servicio calienta.
+- La barra de estado de la GUI muestra origen y total indexado (ejemplo: `service | indexed=...`).
+
+```powershell
+Get-Content C:\ProgramData\Rayo\service.log -Tail 20 -Wait
+```
 
 ### Desinstalar plugin y servicio
 
