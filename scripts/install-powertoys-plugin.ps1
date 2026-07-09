@@ -135,18 +135,11 @@ function Download-ReleaseAsset {
     return $assetPath
 }
 
-$defaultLocalZip = Join-Path (Get-Location) "dist/powertoys-run/RayoPlugin.zip"
-$defaultWindowsBundleZip = Join-Path (Get-Location) "dist/rayo-windows.zip"
 $release = $null
 
 if ([string]::IsNullOrWhiteSpace($PluginZipPath)) {
-    if (Test-Path $defaultLocalZip) {
-        $PluginZipPath = $defaultLocalZip
-        Write-Host "Using local plugin zip: $PluginZipPath"
-    } else {
-        $release = Get-ReleaseMetadata -Repo $Repository -Tag $ReleaseTag
-        $PluginZipPath = Download-ReleaseAsset -Release $release -AssetName "RayoPlugin.zip"
-    }
+    $release = Get-ReleaseMetadata -Repo $Repository -Tag $ReleaseTag
+    $PluginZipPath = Download-ReleaseAsset -Release $release -AssetName "RayoPlugin.zip"
 }
 
 if (-not (Test-Path $PluginZipPath)) {
@@ -154,15 +147,10 @@ if (-not (Test-Path $PluginZipPath)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($WindowsBundleZipPath)) {
-    if (Test-Path $defaultWindowsBundleZip) {
-        $WindowsBundleZipPath = $defaultWindowsBundleZip
-        Write-Host "Using local Windows bundle zip: $WindowsBundleZipPath"
-    } else {
-        if ($null -eq $release) {
-            $release = Get-ReleaseMetadata -Repo $Repository -Tag $ReleaseTag
-        }
-        $WindowsBundleZipPath = Download-ReleaseAsset -Release $release -AssetName "rayo-windows.zip"
+    if ($null -eq $release) {
+        $release = Get-ReleaseMetadata -Repo $Repository -Tag $ReleaseTag
     }
+    $WindowsBundleZipPath = Download-ReleaseAsset -Release $release -AssetName "rayo-windows.zip"
 }
 
 if (-not (Test-Path $WindowsBundleZipPath)) {
@@ -231,6 +219,15 @@ Write-Host "Rayo binaries installed at: $serviceRoot"
 if ($InstallBackgroundTask) {
     $cliExe = Join-Path $serviceRoot "rayo-cli.exe"
     $serviceExe = Join-Path $serviceRoot "rayo-service.exe"
+    $compatOutput = & $cliExe service --help 2>&1
+    $compatExitCode = $LASTEXITCODE
+    if ($compatExitCode -ne 0) {
+        $compatText = ($compatOutput | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($compatText)) {
+            $compatText = "No output from rayo-cli compatibility check."
+        }
+        throw "Installed rayo-cli is incompatible and does not support 'service install'. Use release binaries v0.1.6 or newer.`n$compatText"
+    }
     Write-Host "Registering and starting background task: Rayo Service"
     $taskProc = Start-Process -FilePath $cliExe -ArgumentList @("service", "install", "--service-exe", $serviceExe, "--drives", $ServiceDrives) -Verb RunAs -Wait -PassThru
     if ($taskProc.ExitCode -ne 0) {
