@@ -27,12 +27,19 @@ function Stop-PowerToysIfRunning {
     if (-not $ShouldStop) {
         return $false
     }
-    $procs = Get-Process -Name "PowerToys" -ErrorAction SilentlyContinue
+    $procs = Get-Process -Name "PowerToys*" -ErrorAction SilentlyContinue
     if ($null -eq $procs) {
         return $false
     }
-    $procs | Stop-Process -Force
-    Start-Sleep -Milliseconds 700
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+        $stillRunning = Get-Process -Name "PowerToys*" -ErrorAction SilentlyContinue
+        if ($null -eq $stillRunning) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    }
     return $true
 }
 

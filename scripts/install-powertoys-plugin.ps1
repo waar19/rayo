@@ -43,12 +43,19 @@ function Stop-PowerToysIfRunning {
     if (-not $ShouldStop) {
         return $false
     }
-    $procs = Get-Process -Name "PowerToys" -ErrorAction SilentlyContinue
+    $procs = Get-Process -Name "PowerToys*" -ErrorAction SilentlyContinue
     if ($null -eq $procs) {
         return $false
     }
-    $procs | Stop-Process -Force
-    Start-Sleep -Milliseconds 700
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline) {
+        $stillRunning = Get-Process -Name "PowerToys*" -ErrorAction SilentlyContinue
+        if ($null -eq $stillRunning) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 250
+    }
     return $true
 }
 
@@ -92,6 +99,31 @@ function Copy-WithRetry {
                 throw
             }
             Write-Warning "File is busy while updating '$Destination' (attempt $attempt/$MaxAttempts). Retrying..."
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+}
+
+function Remove-PathWithRetry {
+    param(
+        [string]$Path,
+        [int]$MaxAttempts = 8,
+        [int]$DelayMs = 900
+    )
+
+    if (-not (Test-Path $Path)) {
+        return $false
+    }
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Remove-Item -Path $Path -Recurse -Force
+            return $true
+        } catch {
+            if ($attempt -eq $MaxAttempts) {
+                throw
+            }
+            Write-Warning "Path is busy while removing '$Path' (attempt $attempt/$MaxAttempts). Retrying..."
             Start-Sleep -Milliseconds $DelayMs
         }
     }
@@ -206,7 +238,7 @@ $powerToysWasRunning = Stop-PowerToysIfRunning -ShouldStop $RestartPowerToys
 
 if (Test-Path $pluginRoot) {
     try {
-        Remove-Item -Recurse -Force $pluginRoot
+        Remove-PathWithRetry -Path $pluginRoot | Out-Null
     } catch {
         throw "Plugin directory is locked. Close PowerToys and rerun installer, or use -RestartPowerToys `$true."
     }
