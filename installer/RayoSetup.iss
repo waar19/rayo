@@ -35,7 +35,7 @@ Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.es.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install-powertoys-plugin.ps1"" -PluginZipPath ""{app}\RayoPlugin.zip"" -WindowsBundleZipPath ""{app}\rayo-windows.zip"" -AutoInstallDependencies $true -RestartPowerToys $true"; Flags: runhidden waituntilterminated ignoreerrors
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\install-powertoys-plugin.ps1"" -PluginZipPath ""{app}\RayoPlugin.zip"" -WindowsBundleZipPath ""{app}\rayo-windows.zip"" -AutoInstallDependencies $true -RestartPowerToys $true"; Flags: runhidden waituntilterminated
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\uninstall-powertoys-plugin.ps1"" -RestartPowerToys $true"; Flags: runhidden waituntilterminated
