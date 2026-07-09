@@ -41,6 +41,7 @@ const DEFAULT_PIPE: &str = r"\\.\pipe\rayo-query";
 const RAYO_GUI_MUTEX_NAME: &str = "Global\\RayoGuiSingleton";
 const RAYO_HOTKEY_ID: i32 = 0x5261;
 const RELEASES_LATEST_API: &str = "https://api.github.com/repos/waar19/rayo/releases/latest";
+const RELEASES_LATEST_PAGE: &str = "https://github.com/waar19/rayo/releases/latest";
 const APP_CATALOG_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Parser, Debug)]
@@ -166,6 +167,7 @@ struct GuiSettings {
     apps_mode: bool,
     theme_auto: bool,
     light_theme: bool,
+    check_updates: bool,
 }
 
 impl Default for GuiSettings {
@@ -182,6 +184,7 @@ impl Default for GuiSettings {
             apps_mode: true,
             theme_auto: true,
             light_theme: false,
+            check_updates: true,
         }
     }
 }
@@ -298,8 +301,9 @@ fn settings_hint(settings: &GuiSettings) -> String {
     } else {
         "dark"
     };
+    let updates = if settings.check_updates { "on" } else { "off" };
     format!(
-        "search={search_mode} scope={scope} ext={extension} mode={mode} fuzzy={fuzzy} apps={apps} theme={theme} limit={} debounce={}ms",
+        "search={search_mode} scope={scope} ext={extension} mode={mode} fuzzy={fuzzy} apps={apps} theme={theme} updates={updates} limit={} debounce={}ms",
         settings.limit, settings.debounce_ms
     )
 }
@@ -383,6 +387,7 @@ fn save_settings(settings: &GuiSettings) -> Result<()> {
 struct UpdateCheckState {
     checked_at_epoch_secs: u64,
     latest_version: Option<String>,
+    latest_url: Option<String>,
 }
 
 impl Default for UpdateCheckState {
@@ -390,8 +395,15 @@ impl Default for UpdateCheckState {
         Self {
             checked_at_epoch_secs: 0,
             latest_version: None,
+            latest_url: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct UpdateNotice {
+    latest_version: String,
+    release_url: String,
 }
 
 fn update_state_path() -> Result<PathBuf> {
@@ -427,7 +439,7 @@ fn version_is_newer(latest: &str, current: &str) -> bool {
     false
 }
 
-fn maybe_check_updates() -> Option<String> {
+fn maybe_check_updates() -> Option<UpdateNotice> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -446,7 +458,12 @@ fn maybe_check_updates() -> Option<String> {
         if let Some(latest) = state.latest_version
             && version_is_newer(&latest, env!("CARGO_PKG_VERSION"))
         {
-            return Some(format!("Update available: {latest}. Run installer script."));
+            return Some(UpdateNotice {
+                latest_version: latest,
+                release_url: state
+                    .latest_url
+                    .unwrap_or_else(|| RELEASES_LATEST_PAGE.to_string()),
+            });
         }
         return None;
     }
@@ -461,9 +478,15 @@ fn maybe_check_updates() -> Option<String> {
         .and_then(|value| value.as_str())
         .map(|value| value.trim().trim_start_matches(['v', 'V']).to_string())
         .filter(|value| !value.is_empty());
+    let latest_url = payload
+        .get("html_url")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
+        .filter(|value| !value.is_empty());
     let next = UpdateCheckState {
         checked_at_epoch_secs: now,
         latest_version: latest.clone(),
+        latest_url: latest_url.clone(),
     };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -475,7 +498,10 @@ fn maybe_check_updates() -> Option<String> {
     if let Some(latest) = latest
         && version_is_newer(&latest, env!("CARGO_PKG_VERSION"))
     {
-        return Some(format!("Update available: {latest}. Run installer script."));
+        return Some(UpdateNotice {
+            latest_version: latest,
+            release_url: latest_url.unwrap_or_else(|| RELEASES_LATEST_PAGE.to_string()),
+        });
     }
     None
 }
@@ -1402,6 +1428,7 @@ fn main() -> Result<()> {
     let app_catalog: Arc<Mutex<AppCatalogCache>> = Arc::new(Mutex::new(AppCatalogCache::default()));
     let latest_request = Arc::new(AtomicU64::new(0));
     let result_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let update_release_url: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let ui = MainWindow::new().map_err(|err| anyhow!("failed to create GUI: {err}"))?;
     ui.set_under_text(
@@ -1434,6 +1461,7 @@ fn main() -> Result<()> {
     ui.set_settings_apps_mode(initial_settings.apps_mode);
     ui.set_settings_theme_auto(initial_settings.theme_auto);
     ui.set_settings_light_theme(initial_settings.light_theme);
+    ui.set_settings_check_updates(initial_settings.check_updates);
     ui.set_theme_light(initial_settings.light_theme);
     ui.set_settings_hint(settings_hint(&initial_settings).into());
     if let Some(notice) = startup_notice {
@@ -1486,11 +1514,29 @@ fn main() -> Result<()> {
 
     {
         let update_ui = ui.as_weak();
+        let settings_state = settings_state.clone();
+        let update_release_url = update_release_url.clone();
         thread::spawn(move || {
-            if let Some(message) = maybe_check_updates() {
+            let should_check = {
+                let settings = read_settings(&settings_state);
+                settings.check_updates
+            };
+            if !should_check {
+                return;
+            }
+            if let Some(notice) = maybe_check_updates() {
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = update_ui.upgrade() {
-                        ui.set_status_text(message.into());
+                        if let Ok(mut guard) = update_release_url.lock() {
+                            *guard = Some(notice.release_url.clone());
+                        }
+                        ui.set_update_banner_text(
+                            format!("Update available: {}", notice.latest_version).into(),
+                        );
+                        ui.set_status_text(
+                            format!("Update available: {}. Click Update.", notice.latest_version)
+                                .into(),
+                        );
                     }
                 });
             }
@@ -1598,6 +1644,7 @@ fn main() -> Result<()> {
                 ui.set_settings_apps_mode(settings.apps_mode);
                 ui.set_settings_theme_auto(settings.theme_auto);
                 ui.set_settings_light_theme(settings.light_theme);
+                ui.set_settings_check_updates(settings.check_updates);
                 ui.set_settings_error_text("".into());
                 ui.set_show_settings(true);
             }
@@ -1630,6 +1677,7 @@ fn main() -> Result<()> {
                 ui.set_settings_apps_mode(defaults.apps_mode);
                 ui.set_settings_theme_auto(defaults.theme_auto);
                 ui.set_settings_light_theme(defaults.light_theme);
+                ui.set_settings_check_updates(defaults.check_updates);
                 ui.set_settings_error_text("".into());
             }
         });
@@ -1664,7 +1712,8 @@ fn main() -> Result<()> {
                   fuzzy_mode,
                   apps_mode,
                   theme_auto,
-                  light_theme| {
+                  light_theme,
+                  check_updates| {
                 let mut next = GuiSettings {
                     under_dir: normalize_optional_text(under_dir.to_string()),
                     extension: normalize_optional_text(extension.to_string()),
@@ -1677,6 +1726,7 @@ fn main() -> Result<()> {
                     apps_mode,
                     theme_auto,
                     light_theme,
+                    check_updates,
                 };
                 sanitize_settings(&mut next);
                 if next.theme_auto {
@@ -1838,6 +1888,23 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let update_release_url = update_release_url.clone();
+        ui.on_open_update_link(move || {
+            let url = update_release_url
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .unwrap_or_else(|| RELEASES_LATEST_PAGE.to_string());
+            if let Err(err) = shell_open(&url, false)
+                && let Some(ui) = ui_weak.upgrade()
+            {
+                ui.set_status_text(format!("Open update link failed: {err}").into());
             }
         });
     }

@@ -45,6 +45,8 @@ export component MainWindow inherits Window {
     in-out property <bool> settings-apps-mode: true;
     in-out property <bool> settings-theme-auto: true;
     in-out property <bool> settings-light-theme: false;
+    in-out property <bool> settings-check-updates: true;
+    in-out property <string> update-banner-text: "";
     in-out property <bool> show-context-menu: false;
     in-out property <int> context-row-index: -1;
     in-out property <string> settings-error-text: "";
@@ -56,7 +58,7 @@ export component MainWindow inherits Window {
     callback search-now();
     callback search-mode-changed(bool);
     callback open-settings();
-    callback save-settings(string, string, bool, bool, int, int, bool, bool, bool, bool, bool);
+    callback save-settings(string, string, bool, bool, int, int, bool, bool, bool, bool, bool, bool);
     callback cancel-settings();
     callback reset-settings();
     callback clear-settings-filters();
@@ -68,6 +70,7 @@ export component MainWindow inherits Window {
     callback open-selected-admin();
     callback open-folder-selected();
     callback copy-path-selected();
+    callback open-update-link();
 
     VerticalBox {
         spacing: 10px;
@@ -151,6 +154,32 @@ export component MainWindow inherits Window {
                     color: root.color-muted;
                     vertical-alignment: center;
                     overflow: elide;
+                }
+            }
+        }
+
+        if root.update-banner-text != "" : Rectangle {
+            border-color: root.color-border;
+            border-width: 1px;
+            border-radius: 8px;
+            background: root.theme-light ? #eaf4ff : #152236;
+
+            HorizontalBox {
+                padding: 10px;
+                spacing: 8px;
+
+                Text {
+                    text: root.update-banner-text;
+                    color: root.color-text;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { horizontal-stretch: 1; }
+
+                Button {
+                    text: "Update";
+                    horizontal-stretch: 0;
+                    clicked => { root.open-update-link(); }
                 }
             }
         }
@@ -387,6 +416,11 @@ export component MainWindow inherits Window {
                                 }
                             }
 
+                            CheckBox {
+                                text: "Check updates daily";
+                                checked <=> root.settings-check-updates;
+                            }
+
                             if root.settings-error-text != "" : Text {
                                 text: root.settings-error-text;
                                 color: #ff6b6b;
@@ -477,7 +511,8 @@ export component MainWindow inherits Window {
                                             root.settings-fuzzy-mode,
                                             root.settings-apps-mode,
                                             root.settings-theme-auto,
-                                            root.settings-light-theme
+                                            root.settings-light-theme,
+                                            root.settings-check-updates
                                         );
                                     }
                                 }

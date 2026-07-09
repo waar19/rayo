@@ -4,6 +4,11 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 
 [English](README.md) | Español
 
+![CI](https://github.com/waar19/rayo/actions/workflows/ci.yml/badge.svg)
+![Release](https://github.com/waar19/rayo/actions/workflows/release.yml/badge.svg)
+![Licencia: MIT](https://img.shields.io/badge/licencia-MIT-blue.svg)
+![Winget](https://img.shields.io/badge/winget-waar19.Rayo-2ea44f)
+
 ## Qué hace Rayo hoy (MVP)
 
 - Enumera la MFT de NTFS usando `FSCTL_ENUM_USN_DATA`.
@@ -33,6 +38,34 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 - Windows (volumen NTFS).
 - Toolchain de Rust (`cargo`).
 - Privilegios de Administrador para `index` y `watch` (necesarios para leer MFT/USN).
+
+## Instalación
+
+Ruta principal:
+
+```powershell
+winget install waar19.Rayo
+```
+
+Actualizar:
+
+```powershell
+winget upgrade waar19.Rayo
+```
+
+Instalador alterno:
+
+- Descarga `RayoSetup.exe` desde [Releases](https://github.com/waar19/rayo/releases/latest).
+
+## Demo
+
+Imagen preview:
+
+![Rayo social preview](assets/social-preview.svg)
+
+Checklist de captura demo:
+
+- [`docs/demo-recording-checklist.md`](docs/demo-recording-checklist.md)
 
 ## Inicio rápido
 
@@ -84,6 +117,12 @@ cargo run -p rayo-cli -- shell doctor --gui-path .\target\debug\rayo-gui.exe
 - Hotkey global: `Ctrl+Alt+Espacio` enfoca ventana de Rayo.
 - Consultas vacías o de 1 caracter no disparan búsqueda completa salvo que uses `--under`.
 - Click derecho sobre resultado abre menú contextual de acciones.
+
+### Por qué Rayo (comparativa corta)
+
+- Vs Windows Search: Rayo prioriza velocidad cruda y filtros determinísticos (`under`, `ext`, `exclude`).
+- Vs Everything: Rayo integra servicio de fondo + flujo PowerToys en mismo proyecto.
+- Vs ambos: Rayo es open source, en Rust, y automatizable por CLI/servicio.
 
 ### Flags contextuales de GUI
 
@@ -139,10 +178,9 @@ Validación de servicio + integración:
 
 ### Siguiente
 
-- Distribución más sólida:
-  - publicar `RayoSetup.exe` desde release workflow (Inno Setup),
-  - automatizar PR a Winget con `wingetcreate`.
-- Consultas sintácticas con `tree-sitter` (CLI primero, GUI después).
+- Banner de actualización en GUI con chequeo diario de release y acceso directo.
+- Rollout de firma de código (Trusted Signing) para reducir fricción SmartScreen.
+- Paquete de lanzamiento público: media demo + posts de distribución.
 
 ## CI y empaquetado de release
 
@@ -252,6 +290,10 @@ pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
   - `RayoSetup.exe`
   - `rayo-winget-manifest-<versión>.zip`
 - Instalador descarga `RayoPlugin.zip` del último release automáticamente cuando no recibe `-PluginZipPath`.
+
+Imagen social preview para tarjetas del repositorio:
+
+- `assets/social-preview.svg`
 
 Generar paquete de manifiesto Winget local:
 

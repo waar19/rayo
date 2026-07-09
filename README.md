@@ -4,6 +4,11 @@ Ultra-fast file search engine for Windows, written in Rust and inspired by Every
 
 English | [Español](README.es.md)
 
+![CI](https://github.com/waar19/rayo/actions/workflows/ci.yml/badge.svg)
+![Release](https://github.com/waar19/rayo/actions/workflows/release.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Winget](https://img.shields.io/badge/winget-waar19.Rayo-2ea44f)
+
 ## What Rayo does today (MVP)
 
 - Enumerates NTFS MFT using `FSCTL_ENUM_USN_DATA`.
@@ -33,6 +38,34 @@ English | [Español](README.es.md)
 - Windows (NTFS volume).
 - Rust toolchain (`cargo`).
 - Administrator privileges for `index` and `watch` (needed to read MFT/USN).
+
+## Install
+
+Primary install path:
+
+```powershell
+winget install waar19.Rayo
+```
+
+Upgrade:
+
+```powershell
+winget upgrade waar19.Rayo
+```
+
+Alternative installer:
+
+- Download `RayoSetup.exe` from [Releases](https://github.com/waar19/rayo/releases/latest).
+
+## Demo
+
+Preview image:
+
+![Rayo social preview](assets/social-preview.svg)
+
+Demo capture checklist:
+
+- [`docs/demo-recording-checklist.md`](docs/demo-recording-checklist.md)
 
 ## Quick start
 
@@ -84,6 +117,12 @@ cargo run -p rayo-cli -- shell doctor --gui-path .\target\debug\rayo-gui.exe
 - Global hotkey: `Ctrl+Alt+Space` focuses Rayo window.
 - Empty or 1-character queries do not run full search unless `--under` is set.
 - Right-click on result row opens contextual action menu.
+
+### Why Rayo (short comparison)
+
+- Vs Windows Search: Rayo focuses raw speed and deterministic filters (`under`, `ext`, `exclude`).
+- Vs Everything: Rayo adds built-in service + PowerToys plugin workflow in same project.
+- Vs both: Rayo is fully open source, Rust-based, and scriptable by CLI/service.
 
 ### Contextual GUI launch flags
 
@@ -139,10 +178,9 @@ Service + integration validation:
 
 ### Next
 
-- Distribution hardening:
-  - publish `RayoSetup.exe` from release workflow (Inno Setup),
-  - automate Winget submission PR with `wingetcreate`.
-- Syntax-aware queries with `tree-sitter` (CLI first, GUI after).
+- GUI update banner with daily release check and one-click update link.
+- Code-signing rollout (Trusted Signing) to reduce SmartScreen friction.
+- Public launch package: demo media + distribution posts.
 
 ## CI and release packaging
 
@@ -252,6 +290,10 @@ pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
   - `RayoSetup.exe`
   - `rayo-winget-manifest-<version>.zip`
 - Installer downloads `RayoPlugin.zip` from latest release automatically when `-PluginZipPath` is omitted.
+
+Social preview image for repository cards:
+
+- `assets/social-preview.svg`
 
 Generate Winget manifest package locally:
 
