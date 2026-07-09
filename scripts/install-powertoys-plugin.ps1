@@ -52,6 +52,51 @@ function Stop-PowerToysIfRunning {
     return $true
 }
 
+function Stop-RayoServiceIfRunning {
+    param(
+        [string]$ServiceRootPath
+    )
+
+    $existingCli = Join-Path $ServiceRootPath "rayo-cli.exe"
+    if (-not (Test-Path $existingCli)) {
+        return
+    }
+
+    Write-Host "Stopping existing Rayo background task before updating binaries..."
+    try {
+        $stopProc = Start-Process -FilePath $existingCli -ArgumentList @("service", "uninstall") -Verb RunAs -Wait -PassThru
+        if ($stopProc.ExitCode -ne 0) {
+            Write-Warning "Could not uninstall existing Rayo background task automatically (exit code $($stopProc.ExitCode))."
+        }
+    } catch {
+        Write-Warning "Could not stop existing Rayo background task automatically: $($_.Exception.Message)"
+    }
+
+    Start-Sleep -Milliseconds 1200
+}
+
+function Copy-WithRetry {
+    param(
+        [string]$Source,
+        [string]$Destination,
+        [int]$MaxAttempts = 8,
+        [int]$DelayMs = 900
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Copy-Item $Source -Destination $Destination -Force
+            return
+        } catch {
+            if ($attempt -eq $MaxAttempts) {
+                throw
+            }
+            Write-Warning "File is busy while updating '$Destination' (attempt $attempt/$MaxAttempts). Retrying..."
+            Start-Sleep -Milliseconds $DelayMs
+        }
+    }
+}
+
 function Get-ReleaseMetadata {
     param(
         [string]$Repo,
@@ -177,8 +222,9 @@ if (-not (Test-Path $cliSource)) {
 }
 
 New-Item -ItemType Directory -Path $serviceRoot -Force | Out-Null
-Copy-Item $serviceSource -Destination (Join-Path $serviceRoot "rayo-service.exe") -Force
-Copy-Item $cliSource -Destination (Join-Path $serviceRoot "rayo-cli.exe") -Force
+Stop-RayoServiceIfRunning -ServiceRootPath $serviceRoot
+Copy-WithRetry -Source $serviceSource -Destination (Join-Path $serviceRoot "rayo-service.exe")
+Copy-WithRetry -Source $cliSource -Destination (Join-Path $serviceRoot "rayo-cli.exe")
 Remove-Item -Recurse -Force $serviceTempDir
 Write-Host "Rayo binaries installed at: $serviceRoot"
 
