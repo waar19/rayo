@@ -177,6 +177,8 @@ Modo contenido desde plugin:
 
 `ry c <regex>`
 
+Plugin también busca apps instaladas (Start Menu/WindowsApps) y muestra iconos por defecto cuando es posible.
+
 ### Ejecutar como servicio en segundo plano (recomendado)
 
 Usa el modo de tarea programada para que Rayo corra sin ventana de consola visible:

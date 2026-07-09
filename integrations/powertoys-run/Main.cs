@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
 using System.Windows;
@@ -18,6 +19,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
     private const string PluginVersion = "0.4.0";
     private const string ReleasesLatestApi = "https://api.github.com/repos/waar19/rayo/releases/latest";
     private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(4) };
+    private static readonly TimeSpan AppCatalogTtl = TimeSpan.FromMinutes(10);
 
     public string Name => "Rayo";
 
@@ -26,6 +28,9 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
     private readonly RayoPipeClient _pipeClient = new();
     private PluginInitContext? _pluginContext;
     private bool _updateCheckStarted;
+    private readonly object _appCatalogLock = new();
+    private List<AppEntry> _appCatalog = [];
+    private DateTimeOffset _appCatalogBuiltAt = DateTimeOffset.MinValue;
 
     public void Init(PluginInitContext context)
     {
@@ -85,9 +90,11 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 
             var mapped = new List<Result>(response.Results.Count);
             var scoreBase = isGlobalQuery ? 100 : 10_000;
+            var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (var idx = 0; idx < response.Results.Count; idx++)
             {
                 var item = response.Results[idx];
+                seenPaths.Add(item.Path);
                 var title = Path.GetFileName(item.Path);
                 if (string.IsNullOrWhiteSpace(title))
                 {
@@ -99,7 +106,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
                     Title = title,
                     SubTitle = FormatSubTitle(item),
                     Score = scoreBase - idx,
-                    IcoPath = item.IsDirectory ? "Images\\rayo.folder.png" : "Images\\rayo.file.png",
+                    IcoPath = ResolveItemIconPath(item),
                     ContextData = item,
                     Action = action =>
                     {
@@ -110,6 +117,15 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
                         return OpenItem(item.Path, asAdmin: false);
                     },
                 });
+            }
+
+            if (!string.Equals(mode, "content", StringComparison.OrdinalIgnoreCase))
+            {
+                mapped.AddRange(BuildAppResults(input, isGlobalQuery, mapped.Count, seenPaths));
+                if (mapped.Count > 20)
+                {
+                    mapped = mapped.Take(20).ToList();
+                }
             }
 
             return mapped;
@@ -136,6 +152,180 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             return $"{item.Path}:{item.LineNumber}{excerpt}";
         }
         return item.Path;
+    }
+
+    private static string ResolveItemIconPath(QueryResultItem item)
+    {
+        if (item.IsDirectory)
+        {
+            return "Images\\rayo.folder.png";
+        }
+
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(item.Path) && File.Exists(item.Path))
+            {
+                // PowerToys extracts associated icon from file/shortcut/exe path.
+                return item.Path;
+            }
+        }
+        catch
+        {
+            // Ignore icon resolution errors and fall back to static icon.
+        }
+        return "Images\\rayo.file.png";
+    }
+
+    private List<Result> BuildAppResults(
+        string input,
+        bool isGlobalQuery,
+        int existingCount,
+        HashSet<string> seenPaths
+    )
+    {
+        if (string.IsNullOrWhiteSpace(input) || input.Length < 2)
+        {
+            return [];
+        }
+
+        var appLimit = Math.Clamp(20 - existingCount, 0, 8);
+        if (appLimit == 0)
+        {
+            return [];
+        }
+
+        var apps = SearchApps(input, appLimit, seenPaths);
+        if (apps.Count == 0)
+        {
+            return [];
+        }
+
+        var scoreBase = isGlobalQuery ? 90 : 9_000;
+        var mapped = new List<Result>(apps.Count);
+        for (var idx = 0; idx < apps.Count; idx++)
+        {
+            var app = apps[idx];
+            var iconPath = File.Exists(app.LaunchPath) ? app.LaunchPath : "Images\\rayo.file.png";
+            var contextItem = new QueryResultItem
+            {
+                Path = app.LaunchPath,
+                IsDirectory = false,
+            };
+            mapped.Add(
+                new Result
+                {
+                    Title = app.DisplayName,
+                    SubTitle = $"App \u2022 {app.LaunchPath}",
+                    Score = scoreBase - idx,
+                    IcoPath = iconPath,
+                    ContextData = contextItem,
+                    Action = action =>
+                    {
+                        if (action?.SpecialKeyState?.CtrlPressed == true)
+                        {
+                            return OpenContainingFolder(app.LaunchPath);
+                        }
+                        return OpenItem(app.LaunchPath, asAdmin: false);
+                    },
+                }
+            );
+        }
+        return mapped;
+    }
+
+    private List<AppEntry> SearchApps(string query, int limit, HashSet<string> seenPaths)
+    {
+        var catalog = GetOrBuildAppCatalog();
+        return catalog
+            .Where(app => !seenPaths.Contains(app.LaunchPath))
+            .Where(app =>
+                app.DisplayName.Contains(query, StringComparison.OrdinalIgnoreCase)
+                || app.LaunchPath.Contains(query, StringComparison.OrdinalIgnoreCase)
+            )
+            .OrderBy(app => app.DisplayName.StartsWith(query, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+            .ThenBy(app => app.DisplayName.Length)
+            .Take(limit)
+            .ToList();
+    }
+
+    private List<AppEntry> GetOrBuildAppCatalog()
+    {
+        lock (_appCatalogLock)
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (_appCatalog.Count > 0 && (now - _appCatalogBuiltAt) < AppCatalogTtl)
+            {
+                return _appCatalog;
+            }
+
+            _appCatalog = BuildAppCatalog();
+            _appCatalogBuiltAt = now;
+            return _appCatalog;
+        }
+    }
+
+    private static List<AppEntry> BuildAppCatalog()
+    {
+        var roots = new List<string>();
+        AddIfDirectoryExists(roots, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.StartMenu), "Programs"));
+        AddIfDirectoryExists(
+            roots,
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu), "Programs")
+        );
+        AddIfDirectoryExists(
+            roots,
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "WindowsApps")
+        );
+
+        var entries = new Dictionary<string, AppEntry>(StringComparer.OrdinalIgnoreCase);
+        var allowedExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".lnk", ".appref-ms", ".exe" };
+
+        foreach (var root in roots.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            IEnumerable<string> files;
+            try
+            {
+                files = Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                var extension = Path.GetExtension(file);
+                if (!allowedExtensions.Contains(extension))
+                {
+                    continue;
+                }
+
+                var name = Path.GetFileNameWithoutExtension(file)?.Trim();
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    continue;
+                }
+                if (name.StartsWith("Uninstall", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (!entries.ContainsKey(file))
+                {
+                    entries[file] = new AppEntry(name, file);
+                }
+            }
+        }
+
+        return entries.Values.OrderBy(item => item.DisplayName, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static void AddIfDirectoryExists(List<string> roots, string? path)
+    {
+        if (!string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
+        {
+            roots.Add(path);
+        }
     }
 
     public List<ContextMenuResult> LoadContextMenus(Result selectedResult)
@@ -523,6 +713,8 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         var content = JsonSerializer.Serialize(state);
         return File.WriteAllTextAsync(path, content);
     }
+
+    private sealed record AppEntry(string DisplayName, string LaunchPath);
 
     private sealed class UpdateState
     {

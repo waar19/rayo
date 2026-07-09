@@ -177,6 +177,8 @@ Content mode from plugin:
 
 `ry c <regex>`
 
+Plugin also searches installed apps (Start Menu/WindowsApps) and shows default app icons when possible.
+
 ### Run as background service (recommended)
 
 Use the new scheduled-task mode so Rayo runs without a visible console window:
