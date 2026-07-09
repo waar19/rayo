@@ -33,10 +33,22 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 
     public List<Result> Query(Query query, bool delayedExecution)
     {
+        var isGlobalQuery = string.IsNullOrWhiteSpace(query?.ActionKeyword);
         var input = query?.Search?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(input))
         {
             return [];
+        }
+        if (isGlobalQuery)
+        {
+            if (!delayedExecution)
+            {
+                return [];
+            }
+            if (input.Length < 2)
+            {
+                return [];
+            }
         }
 
         try
@@ -51,7 +63,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             }
             if (string.Equals(response.Status, "starting", StringComparison.OrdinalIgnoreCase))
             {
-                return [BuildServiceStartingResult(response.IndexedEntries)];
+                return isGlobalQuery ? [] : [BuildServiceStartingResult(response.IndexedEntries)];
             }
             if (response?.Results is null || response.Results.Count == 0)
             {
@@ -59,6 +71,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             }
 
             var mapped = new List<Result>(response.Results.Count);
+            var scoreBase = isGlobalQuery ? 100 : 10_000;
             for (var idx = 0; idx < response.Results.Count; idx++)
             {
                 var item = response.Results[idx];
@@ -72,7 +85,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
                 {
                     Title = title,
                     SubTitle = item.Path,
-                    Score = 10_000 - idx,
+                    Score = scoreBase - idx,
                     IcoPath = item.IsDirectory ? "Images\\rayo.folder.png" : "Images\\rayo.file.png",
                     ContextData = item,
                     Action = action =>
@@ -90,15 +103,15 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         }
         catch (TimeoutException) when (IsServiceProcessRunning())
         {
-            return [BuildServiceStartingResult(indexedEntries: null)];
+            return isGlobalQuery ? [] : [BuildServiceStartingResult(indexedEntries: null)];
         }
         catch (Exception)
         {
             if (IsServiceProcessRunning())
             {
-                return [BuildServiceStartingResult(indexedEntries: null)];
+                return isGlobalQuery ? [] : [BuildServiceStartingResult(indexedEntries: null)];
             }
-            return [BuildServiceNotRunningResult()];
+            return isGlobalQuery ? [] : [BuildServiceNotRunningResult()];
         }
     }
 

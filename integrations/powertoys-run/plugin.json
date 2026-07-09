@@ -1,10 +1,10 @@
 {
   "ID": "F8074EA2F6CF4A3A8D996BBA5F95F185",
   "ActionKeyword": "ry",
-  "IsGlobal": false,
+  "IsGlobal": true,
   "Name": "Rayo",
   "Author": "waar19",
-  "Version": "0.1.7",
+  "Version": "0.1.8",
   "Language": "csharp",
   "Website": "https://github.com/waar19/rayo",
   "ExecuteFileName": "Community.PowerToys.Run.Plugin.Rayo.dll",
