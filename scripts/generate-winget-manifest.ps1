@@ -28,6 +28,7 @@ $versionPath = Join-Path $versionDir "$PackageIdentifier.yaml"
 $installerPathOut = Join-Path $versionDir "$PackageIdentifier.installer.yaml"
 
 $defaultLocale = @"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
 PackageIdentifier: $PackageIdentifier
 PackageVersion: $Version
 PackageLocale: en-US
@@ -46,6 +47,7 @@ ManifestVersion: 1.9.0
 "@
 
 $versionManifest = @"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.9.0.schema.json
 PackageIdentifier: $PackageIdentifier
 PackageVersion: $Version
 DefaultLocale: en-US
@@ -55,6 +57,7 @@ ManifestVersion: 1.9.0
 
 if ($InstallerType -eq "zip") {
     $installerManifest = @"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
 PackageIdentifier: $PackageIdentifier
 PackageVersion: $Version
 InstallerType: zip
@@ -71,6 +74,7 @@ ManifestVersion: 1.9.0
 "@
 } else {
     $installerManifest = @"
+# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.9.0.schema.json
 PackageIdentifier: $PackageIdentifier
 PackageVersion: $Version
 InstallerType: inno
