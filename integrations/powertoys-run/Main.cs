@@ -9,6 +9,7 @@ namespace Community.PowerToys.Run.Plugin.Rayo;
 public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 {
     public static string PluginID => "F8074EA2F6CF4A3A8D996BBA5F95F185";
+    private const string BackgroundTaskName = "Rayo Service";
     private const string ServiceExecutableName = "rayo-service.exe";
     private const string ServicePathEnvironmentVariable = "RAYO_SERVICE_PATH";
 
@@ -206,10 +207,16 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
 
     private bool TryStartService()
     {
+        if (TryStartBackgroundTask())
+        {
+            ShowStatus("Starting Rayo background task as administrator. Retry search in a few seconds.");
+            return false;
+        }
+
         var servicePath = ResolveServicePath();
         if (servicePath is null)
         {
-            ShowStatus("rayo-service.exe not found. Install Rayo or set RAYO_SERVICE_PATH.");
+            ShowStatus("Rayo Service task not found and rayo-service.exe was not found. Reinstall plugin or set RAYO_SERVICE_PATH.");
             return false;
         }
 
@@ -229,6 +236,34 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         catch
         {
             ShowStatus("Could not start rayo-service. Confirm UAC and try again.");
+            return false;
+        }
+    }
+
+    private static bool TryStartBackgroundTask()
+    {
+        try
+        {
+            using var process = Process.Start(
+                new ProcessStartInfo
+                {
+                    FileName = "schtasks.exe",
+                    Arguments = $"/run /tn \"{BackgroundTaskName}\"",
+                    UseShellExecute = true,
+                    Verb = "runas",
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                }
+            );
+            if (process is null)
+            {
+                return false;
+            }
+
+            process.WaitForExit(8000);
+            return process.ExitCode == 0;
+        }
+        catch
+        {
             return false;
         }
     }

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
+use std::env;
 use std::ffi::c_void;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,8 +46,10 @@ struct Cli {
     drive: String,
     #[arg(long)]
     drives: Option<String>,
-    #[arg(long, default_value = "index.rayo")]
-    index: PathBuf,
+    #[arg(long)]
+    index: Option<PathBuf>,
+    #[arg(long)]
+    log_file: Option<PathBuf>,
     #[arg(long, default_value_t = 300)]
     poll_ms: u64,
     #[arg(long, default_value_t = 500)]
@@ -100,32 +103,50 @@ struct DriveState {
     index: Arc<RwLock<FileIndex>>,
 }
 
+type SharedLog = Arc<Mutex<File>>;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     require_admin()?;
     let drives = parse_drives(&cli.drive, cli.drives.as_deref())?;
+    let log_path = cli.log_file.unwrap_or_else(default_background_log_path);
+    let logger = open_log_writer(&log_path)?;
+    log_info(
+        &logger,
+        format!("Logging service output to {}", log_path.display()),
+    );
+    let index_base = cli.index.clone();
     let multi_drive = drives.len() > 1;
     let mut drive_states = Vec::with_capacity(drives.len());
     for drive in drives {
-        let index_path = drive_index_path(&cli.index, &drive, multi_drive);
-        let mut index = load_or_build_index(&drive, &index_path)?;
+        let index_path = match &index_base {
+            Some(base) => drive_index_path(base, &drive, multi_drive),
+            None => default_background_index_path_for_drive(&drive),
+        };
+        let mut index = load_or_build_index(&drive, &index_path, &logger)?;
         if cli.trigram {
             let trigram_started = Instant::now();
             index.set_trigram_enabled(true);
-            println!(
-                "Trigram index enabled for {} in {:?}.",
-                drive,
-                trigram_started.elapsed()
+            log_info(
+                &logger,
+                format!(
+                    "Trigram index enabled for {} in {:?}.",
+                    drive,
+                    trigram_started.elapsed()
+                ),
             );
         }
         save_index(&index, &index_path).with_context(|| {
             format!("failed to save bootstrap index at {}", index_path.display())
         })?;
-        println!(
-            "Service bootstrap ready on {} with {} entries ({})",
-            drive,
-            index.entries.len(),
-            index_path.display()
+        log_info(
+            &logger,
+            format!(
+                "Service bootstrap ready on {} with {} entries ({})",
+                drive,
+                index.entries.len(),
+                index_path.display()
+            ),
         );
         drive_states.push(DriveState {
             drive,
@@ -157,14 +178,19 @@ fn main() -> Result<()> {
         let watch_running = running.clone();
         let watch_index_path = state.index_path.clone();
         let watch_drive = state.drive.clone();
+        let watch_logger = logger.clone();
         watch_threads.push(thread::spawn(move || {
-            println!("Watch loop started for {watch_drive}");
+            log_info(
+                &watch_logger,
+                format!("Watch loop started for {watch_drive}"),
+            );
             run_watch_loop(
                 watch_index,
                 watch_running,
                 watch_index_path,
                 watch_poll,
                 watch_persist_every,
+                watch_logger,
             );
         }));
     }
@@ -173,17 +199,25 @@ fn main() -> Result<()> {
     let metrics_indexes = indexes.clone();
     let metrics_state = metrics.clone();
     let metrics_interval = Duration::from_secs(cli.metrics_interval_secs.max(5));
+    let metrics_logger = logger.clone();
     let metrics_thread = thread::spawn(move || {
         run_metrics_reporter(
             metrics_state,
             metrics_indexes,
             metrics_running,
             metrics_interval,
+            metrics_logger,
         );
     });
 
-    println!("Named pipe listening on {PIPE_NAME}");
-    let pipe_result = run_pipe_server(indexes, running.clone(), metrics, cli.default_limit.max(1));
+    log_info(&logger, format!("Named pipe listening on {PIPE_NAME}"));
+    let pipe_result = run_pipe_server(
+        indexes,
+        running.clone(),
+        metrics,
+        cli.default_limit.max(1),
+        logger.clone(),
+    );
     running.store(false, Ordering::SeqCst);
     for handle in watch_threads {
         let _ = handle.join();
@@ -251,30 +285,123 @@ fn drive_index_path(base: &Path, drive: &str, multi_drive: bool) -> PathBuf {
     base.with_file_name(file_name)
 }
 
-fn load_or_build_index(drive: &str, index_path: &PathBuf) -> Result<FileIndex> {
+fn load_or_build_index(drive: &str, index_path: &PathBuf, logger: &SharedLog) -> Result<FileIndex> {
     if index_path.exists() {
         let loaded = load_index(index_path)
             .with_context(|| format!("failed to read {}", index_path.display()))?;
         if loaded.drive.eq_ignore_ascii_case(drive) {
-            println!("Loaded existing index from {}", index_path.display());
+            log_info(
+                logger,
+                format!("Loaded existing index from {}", index_path.display()),
+            );
             return Ok(loaded);
         }
-        println!(
-            "Index drive mismatch ({} vs {}). Rebuilding index.",
-            loaded.drive, drive
+        log_info(
+            logger,
+            format!(
+                "Index drive mismatch ({} vs {}). Rebuilding index.",
+                loaded.drive, drive
+            ),
         );
     } else {
-        println!("No index file found. Building initial index for {drive}.");
+        log_info(
+            logger,
+            format!(
+                "No index file found at {}. Building initial index for {} (this can take a few minutes on first run).",
+                index_path.display(),
+                drive
+            ),
+        );
     }
 
     let started = Instant::now();
-    let index = FileIndex::build(drive)?;
-    println!(
-        "Initial index built: {} entries in {:?}.",
-        index.entries.len(),
-        started.elapsed()
+    let index = build_index_with_progress(drive, logger)?;
+    log_info(
+        logger,
+        format!(
+            "Initial index built: {} entries in {:?}.",
+            index.entries.len(),
+            started.elapsed()
+        ),
     );
     Ok(index)
+}
+
+fn build_index_with_progress(drive: &str, logger: &SharedLog) -> Result<FileIndex> {
+    let progress = Arc::new(AtomicUsize::new(0));
+    let monitor_running = Arc::new(AtomicBool::new(true));
+    let monitor_progress = progress.clone();
+    let monitor_flag = monitor_running.clone();
+    let monitor_drive = drive.to_string();
+    let monitor_logger = logger.clone();
+    let started = Instant::now();
+
+    let monitor = thread::spawn(move || {
+        while monitor_flag.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(2));
+            if !monitor_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            let scanned = monitor_progress.load(Ordering::Relaxed);
+            log_info(
+                &monitor_logger,
+                format!(
+                    "Indexing {} ... {} entries scanned (elapsed {:?})",
+                    monitor_drive,
+                    scanned,
+                    started.elapsed()
+                ),
+            );
+        }
+    });
+
+    let result = FileIndex::build_with_progress(drive, Some(progress.as_ref()));
+    monitor_running.store(false, Ordering::SeqCst);
+    let _ = monitor.join();
+    result
+}
+
+fn default_background_index_path_for_drive(drive: &str) -> PathBuf {
+    let drive_lower = drive.trim_end_matches(':').to_ascii_lowercase();
+    default_background_data_dir().join(format!("{drive_lower}.rayo"))
+}
+
+fn default_background_log_path() -> PathBuf {
+    default_background_data_dir().join("service.log")
+}
+
+fn default_background_data_dir() -> PathBuf {
+    env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Rayo")
+}
+
+fn open_log_writer(path: &Path) -> Result<SharedLog> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create log directory {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open log file {}", path.display()))?;
+    Ok(Arc::new(Mutex::new(file)))
+}
+
+fn log_info(logger: &SharedLog, message: String) {
+    println!("{message}");
+    if let Ok(mut file) = logger.lock() {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn log_error(logger: &SharedLog, message: String) {
+    eprintln!("{message}");
+    if let Ok(mut file) = logger.lock() {
+        let _ = writeln!(file, "{message}");
+    }
 }
 
 fn run_watch_loop(
@@ -283,6 +410,7 @@ fn run_watch_loop(
     index_path: PathBuf,
     poll_ms: u64,
     persist_every_changes: usize,
+    logger: SharedLog,
 ) {
     let sleep = Duration::from_millis(poll_ms);
     let mut since_persist = 0usize;
@@ -307,17 +435,20 @@ fn run_watch_loop(
                     }
                 }
                 Err(err) => {
-                    eprintln!("watch loop error: {err:#}");
+                    log_error(&logger, format!("watch loop error: {err:#}"));
                 }
             }
         }
 
         if changed_now > 0 {
-            println!("Watch applied {changed_now} changes.");
+            log_info(&logger, format!("Watch applied {changed_now} changes."));
         }
         if let Some(snapshot) = snapshot_to_save {
             if let Err(err) = save_index(&snapshot, &index_path) {
-                eprintln!("failed to persist watch snapshot: {err:#}");
+                log_error(
+                    &logger,
+                    format!("failed to persist watch snapshot: {err:#}"),
+                );
             }
         }
         thread::sleep(sleep);
@@ -329,7 +460,10 @@ fn run_watch_loop(
         Err(poisoned) => poisoned.into_inner().clone(),
     };
     if let Err(err) = save_index(&final_snapshot, &index_path) {
-        eprintln!("failed to persist final snapshot: {err:#}");
+        log_error(
+            &logger,
+            format!("failed to persist final snapshot: {err:#}"),
+        );
     }
 }
 
@@ -338,6 +472,7 @@ fn run_pipe_server(
     running: Arc<AtomicBool>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
+    logger: SharedLog,
 ) -> Result<()> {
     while running.load(Ordering::SeqCst) {
         let pipe = create_pipe_instance()?;
@@ -353,13 +488,18 @@ fn run_pipe_server(
 
         let shared_indexes = indexes.clone();
         let shared_metrics = metrics.clone();
+        let shared_logger = logger.clone();
         let pipe_raw = pipe.0 as isize;
         thread::spawn(move || {
             let pipe = HANDLE(pipe_raw as *mut c_void);
-            if let Err(err) =
-                handle_pipe_client(pipe, shared_indexes, shared_metrics, default_limit)
-            {
-                eprintln!("pipe client error: {err:#}");
+            if let Err(err) = handle_pipe_client(
+                pipe,
+                shared_indexes,
+                shared_metrics,
+                default_limit,
+                shared_logger.clone(),
+            ) {
+                log_error(&shared_logger, format!("pipe client error: {err:#}"));
             }
         });
     }
@@ -418,6 +558,7 @@ fn handle_pipe_client(
     indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
+    _logger: SharedLog,
 ) -> Result<()> {
     let owned = unsafe { OwnedHandle::from_raw_handle(pipe.0 as *mut _) };
     let mut stream = File::from(owned);
@@ -501,6 +642,7 @@ fn run_metrics_reporter(
     indexes: Arc<Vec<Arc<RwLock<FileIndex>>>>,
     running: Arc<AtomicBool>,
     interval: Duration,
+    logger: SharedLog,
 ) {
     while running.load(Ordering::SeqCst) {
         thread::sleep(interval);
@@ -534,9 +676,12 @@ fn run_metrics_reporter(
         } else {
             snapshot.total_took_ms as f64 / snapshot.requests_total as f64
         };
-        println!(
-            "[metrics] requests={} avg_ms={average_ms:.2} last_ms={} max_ms={} entries={entries}",
-            snapshot.requests_total, snapshot.last_took_ms, snapshot.max_took_ms
+        log_info(
+            &logger,
+            format!(
+                "[metrics] requests={} avg_ms={average_ms:.2} last_ms={} max_ms={} entries={entries}",
+                snapshot.requests_total, snapshot.last_took_ms, snapshot.max_took_ms
+            ),
         );
     }
 }

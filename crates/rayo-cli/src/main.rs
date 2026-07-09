@@ -1,10 +1,13 @@
 use std::collections::HashSet;
+use std::env;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::SearcherBuilder;
@@ -78,6 +81,11 @@ enum Commands {
         #[command(subcommand)]
         action: ShellAction,
     },
+    /// Install or manage the background Windows scheduled task
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -91,6 +99,22 @@ enum ShellAction {
         #[arg(long)]
         gui_path: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum ServiceAction {
+    Install {
+        #[arg(long)]
+        service_exe: Option<PathBuf>,
+        #[arg(long, default_value = "C")]
+        drives: String,
+        #[arg(long)]
+        index: Option<PathBuf>,
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
+    Uninstall,
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -122,6 +146,7 @@ fn main() -> Result<()> {
             poll_ms,
         } => run_watch(&drive, index, poll_ms),
         Commands::Shell { action } => run_shell(action),
+        Commands::Service { action } => run_service(action),
     }
 }
 
@@ -138,7 +163,7 @@ fn run_index(drive: &str, output: PathBuf) -> Result<()> {
         let output_path = drive_index_path(&output, &drive, multi_drive);
         println!("Building index for {}...", drive);
         let build_started = Instant::now();
-        let index = FileIndex::build(&drive)?;
+        let index = build_index_with_progress(&drive)?;
         println!(
             "MFT/journal scan for {} completed in {:?}. Saving index...",
             drive,
@@ -291,14 +316,14 @@ fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
                 "Existing index belongs to {}. Rebuilding for {}...",
                 loaded.drive, drive
             );
-            FileIndex::build(&drive)?
+            build_index_with_progress(&drive)?
         }
     } else {
         println!(
             "No index found at {}. Building initial index...",
             index_path.display()
         );
-        FileIndex::build(&drive)?
+        build_index_with_progress(&drive)?
     };
     println!("Saving initial watch snapshot...");
     save_index(&index, &index_path)?;
@@ -329,6 +354,43 @@ fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
 
     println!("Watch stopped.");
     Ok(())
+}
+
+fn build_index_with_progress(drive: &str) -> Result<FileIndex> {
+    let progress = Arc::new(AtomicUsize::new(0));
+    let monitor_running = Arc::new(AtomicBool::new(true));
+    let monitor_progress = progress.clone();
+    let monitor_flag = monitor_running.clone();
+    let monitor_drive = drive.to_string();
+    let monitor_started = Instant::now();
+
+    let monitor = thread::spawn(move || {
+        while monitor_flag.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(2));
+            if !monitor_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            let scanned = monitor_progress.load(Ordering::Relaxed);
+            println!(
+                "Indexing {} ... {} entries scanned (elapsed {:?})",
+                monitor_drive,
+                scanned,
+                monitor_started.elapsed()
+            );
+        }
+    });
+
+    let result = FileIndex::build_with_progress(drive, Some(progress.as_ref()));
+    monitor_running.store(false, Ordering::SeqCst);
+    let _ = monitor.join();
+    if let Ok(index) = &result {
+        println!(
+            "Indexing {} completed: {} entries discovered.",
+            drive,
+            index.entries.len()
+        );
+    }
+    result
 }
 
 fn require_admin() -> Result<()> {
@@ -386,6 +448,238 @@ fn drive_index_path(base: &Path, drive: &str, multi_drive: bool) -> PathBuf {
         format!("{stem}-{drive_lower}.{ext}")
     };
     base.with_file_name(file_name)
+}
+
+fn run_service(action: ServiceAction) -> Result<()> {
+    match action {
+        ServiceAction::Install {
+            service_exe,
+            drives,
+            index,
+            log_file,
+        } => run_service_install(service_exe, drives, index, log_file),
+        ServiceAction::Uninstall => run_service_uninstall(),
+        ServiceAction::Status => run_service_status(),
+    }
+}
+
+fn run_service_install(
+    service_exe: Option<PathBuf>,
+    drives_raw: String,
+    index: Option<PathBuf>,
+    log_file: Option<PathBuf>,
+) -> Result<()> {
+    if !is_running_as_admin() {
+        println!("Service install requires Administrator privileges. Requesting elevation...");
+        let mut args = vec![
+            "service".to_string(),
+            "install".to_string(),
+            "--drives".to_string(),
+            drives_raw.clone(),
+        ];
+        if let Some(path) = &service_exe {
+            args.push("--service-exe".to_string());
+            args.push(path.display().to_string());
+        }
+        if let Some(path) = &index {
+            args.push("--index".to_string());
+            args.push(path.display().to_string());
+        }
+        if let Some(path) = &log_file {
+            args.push("--log-file".to_string());
+            args.push(path.display().to_string());
+        }
+        relaunch_self_elevated(&args)?;
+        return Ok(());
+    }
+
+    let drives = parse_drive_list(&drives_raw)?;
+    let drives_csv = drives.join(",");
+    let service_path = resolve_service_exe_path(service_exe)?;
+    let index_base = index.unwrap_or_else(default_background_index_base_path);
+    let log_path = log_file.unwrap_or_else(default_background_log_path);
+
+    if let Some(parent) = index_base.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let task_command =
+        build_service_task_command(&service_path, &drives_csv, &index_base, &log_path);
+    run_schtasks(&[
+        "/create",
+        "/tn",
+        "Rayo Service",
+        "/sc",
+        "ONSTART",
+        "/ru",
+        "SYSTEM",
+        "/rl",
+        "HIGHEST",
+        "/f",
+        "/tr",
+        &task_command,
+    ])?;
+    run_schtasks(&["/run", "/tn", "Rayo Service"])?;
+
+    println!("Background task installed and started.");
+    println!("Task: Rayo Service");
+    println!("Service exe: {}", service_path.display());
+    println!("Index base: {}", index_base.display());
+    println!("Log file: {}", log_path.display());
+    Ok(())
+}
+
+fn run_service_uninstall() -> Result<()> {
+    if !is_running_as_admin() {
+        println!("Service uninstall requires Administrator privileges. Requesting elevation...");
+        let args = vec!["service".to_string(), "uninstall".to_string()];
+        relaunch_self_elevated(&args)?;
+        return Ok(());
+    }
+
+    let _ = run_schtasks(&["/end", "/tn", "Rayo Service"]);
+    let status = Command::new("schtasks")
+        .args(["/delete", "/tn", "Rayo Service", "/f"])
+        .stdin(Stdio::null())
+        .status()
+        .context("failed to execute schtasks /delete")?;
+    if status.success() {
+        println!("Background task removed: Rayo Service");
+    } else {
+        println!("Background task was not installed or could not be removed.");
+    }
+    Ok(())
+}
+
+fn run_service_status() -> Result<()> {
+    let output = Command::new("schtasks")
+        .args(["/query", "/tn", "Rayo Service", "/fo", "LIST", "/v"])
+        .output()
+        .context("failed to query scheduled task status")?;
+    if output.status.success() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    } else {
+        println!("Rayo Service task not found.");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            println!("{stderr}");
+        }
+    }
+    Ok(())
+}
+
+fn run_schtasks(args: &[&str]) -> Result<()> {
+    let status = Command::new("schtasks")
+        .args(args)
+        .stdin(Stdio::null())
+        .status()
+        .with_context(|| format!("failed to execute schtasks with args {args:?}"))?;
+    if !status.success() {
+        return Err(anyhow!("schtasks failed with status {status}"));
+    }
+    Ok(())
+}
+
+fn relaunch_self_elevated(args: &[String]) -> Result<()> {
+    let exe = std::env::current_exe().context("failed to resolve current executable path")?;
+    let exe_quoted = escape_single_quotes(&exe.display().to_string());
+    let args_literal = args
+        .iter()
+        .map(|arg| format!("'{}'", escape_single_quotes(arg)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let command = format!(
+        "Start-Process -FilePath '{exe_quoted}' -ArgumentList @({args_literal}) -Verb RunAs -Wait"
+    );
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command.as_str(),
+        ])
+        .status()
+        .context("failed to invoke elevated PowerShell process")?;
+    if !status.success() {
+        return Err(anyhow!("elevated command failed with status {status}"));
+    }
+    Ok(())
+}
+
+fn escape_single_quotes(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn build_service_task_command(
+    service_exe: &Path,
+    drives_csv: &str,
+    index_base: &Path,
+    log_path: &Path,
+) -> String {
+    format!(
+        "\"{}\" --drives {} --index \"{}\" --log-file \"{}\"",
+        service_exe.display(),
+        drives_csv,
+        index_base.display(),
+        log_path.display()
+    )
+}
+
+fn resolve_service_exe_path(service_exe: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = service_exe {
+        if path.exists() {
+            return Ok(path);
+        }
+        return Err(anyhow!(
+            "rayo-service executable not found at {}",
+            path.display()
+        ));
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(local_app_data)
+                .join("Rayo")
+                .join("rayo-service.exe"),
+        );
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(base) = current_exe.parent() {
+            candidates.push(base.join("rayo-service.exe"));
+        }
+    }
+    candidates.push(Path::new("target").join("release").join("rayo-service.exe"));
+    candidates.push(Path::new("target").join("debug").join("rayo-service.exe"));
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "rayo-service.exe not found. Provide --service-exe or install binaries in %LOCALAPPDATA%\\Rayo."
+    ))
+}
+
+fn default_background_index_base_path() -> PathBuf {
+    default_background_data_dir().join("index.rayo")
+}
+
+fn default_background_log_path() -> PathBuf {
+    default_background_data_dir().join("service.log")
+}
+
+fn default_background_data_dir() -> PathBuf {
+    env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Rayo")
 }
 
 fn run_shell(action: ShellAction) -> Result<()> {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Foundation::{
@@ -34,7 +35,10 @@ pub fn is_running_as_admin() -> bool {
     unsafe { IsUserAnAdmin() == BOOL(1) }
 }
 
-pub fn enumerate_mft(drive: &str) -> Result<MftSnapshot> {
+pub fn enumerate_mft_with_progress(
+    drive: &str,
+    progress_counter: Option<&AtomicUsize>,
+) -> Result<MftSnapshot> {
     let mut entries = HashMap::new();
     let volume = open_volume(drive)?;
     let _guard = HandleGuard(volume);
@@ -95,6 +99,9 @@ pub fn enumerate_mft(drive: &str) -> Result<MftSnapshot> {
                     attributes: record.FileAttributes,
                 },
             );
+            if let Some(counter) = progress_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
             offset += record.RecordLength as usize;
         }
     }

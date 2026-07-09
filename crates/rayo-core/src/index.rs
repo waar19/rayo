@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -8,7 +9,7 @@ use memchr::memmem::Finder;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 
-use crate::ntfs::{collect_changes, enumerate_mft, normalize_drive};
+use crate::ntfs::{collect_changes, enumerate_mft_with_progress, normalize_drive};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -271,8 +272,15 @@ const TRIGRAM_MIN_QUERY_LEN: usize = 8;
 
 impl FileIndex {
     pub fn build(drive: &str) -> Result<Self> {
+        Self::build_with_progress(drive, None)
+    }
+
+    pub fn build_with_progress(
+        drive: &str,
+        progress_counter: Option<&AtomicUsize>,
+    ) -> Result<Self> {
         let drive = normalize_drive(drive)?;
-        let snapshot = enumerate_mft(&drive)?;
+        let snapshot = enumerate_mft_with_progress(&drive, progress_counter)?;
         let mut index = Self {
             drive,
             entries: snapshot.entries,

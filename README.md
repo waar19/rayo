@@ -169,6 +169,21 @@ Then restart PowerToys and search with:
 
 `ry <query>`
 
+### Run as background service (recommended)
+
+Use the new scheduled-task mode so Rayo runs without a visible console window:
+
+```powershell
+rayo-cli service install --service-exe "$env:LOCALAPPDATA\Rayo\rayo-service.exe" --drives C
+rayo-cli service status
+rayo-cli service uninstall
+```
+
+Defaults used by background mode:
+
+- Index files: `%ProgramData%\Rayo\<drive>.rayo`
+- Service log: `%ProgramData%\Rayo\service.log`
+
 ### Dependency-aware installer
 
 One-command install from latest GitHub Release:
@@ -187,6 +202,7 @@ What it does:
 - Detects PowerToys.
 - Installs plugin to `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
 - Installs `rayo-service.exe` and `rayo-cli.exe` to `%LOCALAPPDATA%\Rayo\` so Enter can start service from PowerToys.
+- Registers/starts scheduled task `Rayo Service` for true background startup.
 - Supports `RAYO_SERVICE_PATH` as override for custom service location.
 
 ### Release assets
@@ -200,7 +216,7 @@ What it does:
 
 If PowerToys shows plugin initialization errors for Rayo:
 
-1. Make sure you are on the latest release (`v0.1.4` or newer).
+1. Make sure you are on the latest release (`v0.1.5` or newer).
 2. Reinstall plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex

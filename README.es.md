@@ -169,6 +169,21 @@ Luego reinicia PowerToys y busca con:
 
 `ry <consulta>`
 
+### Ejecutar como servicio en segundo plano (recomendado)
+
+Usa el modo de tarea programada para que Rayo corra sin ventana de consola visible:
+
+```powershell
+rayo-cli service install --service-exe "$env:LOCALAPPDATA\Rayo\rayo-service.exe" --drives C
+rayo-cli service status
+rayo-cli service uninstall
+```
+
+Defaults del modo en segundo plano:
+
+- Índices: `%ProgramData%\Rayo\<drive>.rayo`
+- Log del servicio: `%ProgramData%\Rayo\service.log`
+
 ### Instalador con detección de dependencias
 
 Instalación en un comando desde último GitHub Release:
@@ -187,6 +202,7 @@ Qué hace:
 - Detecta PowerToys.
 - Instala plugin en `%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\Rayo\`.
 - Instala `rayo-service.exe` y `rayo-cli.exe` en `%LOCALAPPDATA%\Rayo\` para que Enter pueda iniciar el servicio desde PowerToys.
+- Registra/inicia la tarea programada `Rayo Service` para arranque real en segundo plano.
 - Soporta `RAYO_SERVICE_PATH` como override para ubicación personalizada del servicio.
 
 ### Assets de release
@@ -200,7 +216,7 @@ Qué hace:
 
 Si PowerToys muestra error al iniciar plugin Rayo:
 
-1. Verifica que usas último release (`v0.1.4` o superior).
+1. Verifica que usas último release (`v0.1.5` o superior).
 2. Reinstala plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex

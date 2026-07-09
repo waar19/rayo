@@ -4,7 +4,9 @@ param(
     [bool]$AutoInstallDependencies = $true,
     [bool]$RestartPowerToys = $true,
     [string]$Repository = "waar19/rayo",
-    [string]$ReleaseTag = ""
+    [string]$ReleaseTag = "",
+    [string]$ServiceDrives = "C",
+    [bool]$InstallBackgroundTask = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -179,6 +181,16 @@ Copy-Item $serviceSource -Destination (Join-Path $serviceRoot "rayo-service.exe"
 Copy-Item $cliSource -Destination (Join-Path $serviceRoot "rayo-cli.exe") -Force
 Remove-Item -Recurse -Force $serviceTempDir
 Write-Host "Rayo binaries installed at: $serviceRoot"
+
+if ($InstallBackgroundTask) {
+    $cliExe = Join-Path $serviceRoot "rayo-cli.exe"
+    $serviceExe = Join-Path $serviceRoot "rayo-service.exe"
+    Write-Host "Registering and starting background task: Rayo Service"
+    $taskProc = Start-Process -FilePath $cliExe -ArgumentList @("service", "install", "--service-exe", $serviceExe, "--drives", $ServiceDrives) -Verb RunAs -Wait -PassThru
+    if ($taskProc.ExitCode -ne 0) {
+        throw "Failed to install background task using rayo-cli (exit code $($taskProc.ExitCode))."
+    }
+}
 
 if ($RestartPowerToys) {
     if ($powerToysExe -and (Test-Path $powerToysExe)) {
