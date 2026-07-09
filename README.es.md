@@ -242,7 +242,7 @@ pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
 
 Si PowerToys muestra error al iniciar plugin Rayo:
 
-1. Verifica que usas último release (`v0.1.6` o superior).
+1. Verifica que usas último release (`v0.1.7` o superior).
 2. Reinstala plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex

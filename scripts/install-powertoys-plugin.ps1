@@ -259,7 +259,7 @@ if ($InstallBackgroundTask) {
         if ([string]::IsNullOrWhiteSpace($compatText)) {
             $compatText = "No output from rayo-cli compatibility check."
         }
-        throw "Installed rayo-cli is incompatible and does not support 'service install'. Use release binaries v0.1.6 or newer.`n$compatText"
+        throw "Installed rayo-cli is incompatible and does not support 'service install'. Use release binaries v0.1.7 or newer.`n$compatText"
     }
     Write-Host "Registering and starting background task: Rayo Service"
     $taskProc = Start-Process -FilePath $cliExe -ArgumentList @("service", "install", "--service-exe", $serviceExe, "--drives", $ServiceDrives) -Verb RunAs -Wait -PassThru

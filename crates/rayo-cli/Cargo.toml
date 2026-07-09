@@ -15,3 +15,6 @@ grep-searcher.workspace = true
 ignore.workspace = true
 rayo-core = { path = "../rayo-core" }
 winreg.workspace = true
+
+[build-dependencies]
+winresource = "0.1"
