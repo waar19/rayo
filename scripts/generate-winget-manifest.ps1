@@ -8,7 +8,9 @@ param(
     [string]$Publisher = "waar19",
     [string]$PackageIdentifier = "waar19.Rayo",
     [string]$PackageName = "Rayo",
-    [string]$OutputRoot = "dist/winget"
+    [string]$OutputRoot = "dist/winget",
+    [ValidateSet("inno", "zip")]
+    [string]$InstallerType = "inno"
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,7 +48,8 @@ ManifestType: version
 ManifestVersion: 1.9.0
 "@
 
-$installerManifest = @"
+if ($InstallerType -eq "zip") {
+    $installerManifest = @"
 PackageIdentifier: $PackageIdentifier
 PackageVersion: $Version
 InstallerType: zip
@@ -61,6 +64,19 @@ Installers:
 ManifestType: installer
 ManifestVersion: 1.9.0
 "@
+} else {
+    $installerManifest = @"
+PackageIdentifier: $PackageIdentifier
+PackageVersion: $Version
+InstallerType: inno
+Installers:
+  - Architecture: x64
+    InstallerUrl: $InstallerUrl
+    InstallerSha256: $hash
+ManifestType: installer
+ManifestVersion: 1.9.0
+"@
+}
 
 Set-Content -Path $defaultLocalePath -Value $defaultLocale -Encoding UTF8
 Set-Content -Path $versionPath -Value $versionManifest -Encoding UTF8

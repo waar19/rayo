@@ -67,6 +67,8 @@ struct Cli {
     trigram: bool,
     #[arg(long, default_value_t = 30)]
     metrics_interval_secs: u64,
+    #[arg(long)]
+    exclude: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,6 +218,7 @@ fn main() -> Result<()> {
         .as_deref()
         .unwrap_or(cli.drive.as_str())
         .eq_ignore_ascii_case("auto");
+    let exclude_prefixes = Arc::new(parse_exclude_list(cli.exclude.as_deref()));
     let drives = parse_drives(&cli.drive, cli.drives.as_deref())?;
     let log_path = cli.log_file.unwrap_or_else(default_background_log_path);
     let logger = open_log_writer(&log_path)?;
@@ -240,12 +243,14 @@ fn main() -> Result<()> {
     let pipe_metrics = metrics.clone();
     let pipe_logger = logger.clone();
     let pipe_default_limit = cli.default_limit.max(1);
+    let pipe_excludes = exclude_prefixes.clone();
     let pipe_thread = thread::spawn(move || {
         run_pipe_server(
             pipe_state,
             pipe_running,
             pipe_metrics,
             pipe_default_limit,
+            pipe_excludes,
             pipe_logger,
         )
     });
@@ -263,6 +268,7 @@ fn main() -> Result<()> {
             &logger,
             service_state.clone(),
             indexed_entries_accumulated,
+            &exclude_prefixes,
         )?;
         let mut index = bootstrap.index;
         if cli.trigram {
@@ -321,6 +327,7 @@ fn main() -> Result<()> {
         let watch_index_path = state.index_path.clone();
         let watch_drive = state.drive.clone();
         let watch_logger = logger.clone();
+        let watch_excludes = exclude_prefixes.clone();
         watch_threads.push(thread::spawn(move || {
             log_info(
                 &watch_logger,
@@ -332,6 +339,7 @@ fn main() -> Result<()> {
                 watch_index_path,
                 watch_poll,
                 watch_persist_every,
+                &watch_excludes,
                 watch_logger,
             );
         }));
@@ -347,6 +355,7 @@ fn main() -> Result<()> {
         let auto_state = service_state.clone();
         let auto_index_base = index_base.clone();
         let auto_trigram = cli.trigram;
+        let auto_excludes = exclude_prefixes.clone();
         thread::spawn(move || {
             run_auto_drive_monitor(
                 known_indexes,
@@ -355,6 +364,7 @@ fn main() -> Result<()> {
                 auto_logger,
                 auto_index_base,
                 auto_trigram,
+                auto_excludes,
             );
         });
     }
@@ -398,9 +408,9 @@ fn require_admin() -> Result<()> {
 fn parse_drives(default_drive: &str, drives_arg: Option<&str>) -> Result<Vec<String>> {
     let raw = drives_arg.unwrap_or(default_drive);
     if raw.eq_ignore_ascii_case("auto") {
-        let detected = detect_fixed_ntfs_drives()?;
+        let detected = detect_fixed_drives()?;
         if detected.is_empty() {
-            return Err(anyhow!("no NTFS fixed drives detected for --drives auto"));
+            return Err(anyhow!("no fixed drives detected for --drives auto"));
         }
         return Ok(detected);
     }
@@ -422,7 +432,7 @@ fn parse_drives(default_drive: &str, drives_arg: Option<&str>) -> Result<Vec<Str
     Ok(drives)
 }
 
-fn detect_fixed_ntfs_drives() -> Result<Vec<String>> {
+fn detect_fixed_drives() -> Result<Vec<String>> {
     let bitmask = unsafe { GetLogicalDrives() };
     if bitmask == 0 {
         return Err(anyhow!("failed to enumerate logical drives"));
@@ -459,11 +469,20 @@ fn detect_fixed_ntfs_drives() -> Result<Vec<String>> {
         let fs_name = String::from_utf16_lossy(&fs_name_buffer)
             .trim_matches('\0')
             .to_string();
-        if fs_name.eq_ignore_ascii_case("NTFS") {
-            drives.push(format!("{}:", letter as char));
-        }
+        let _fs_name = fs_name;
+        drives.push(format!("{}:", letter as char));
     }
     Ok(drives)
+}
+
+fn parse_exclude_list(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(|item| item.trim().replace('/', "\\"))
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 fn drive_index_path(base: &Path, drive: &str, multi_drive: bool) -> PathBuf {
@@ -502,11 +521,14 @@ fn load_or_build_index(
     logger: &SharedLog,
     service_state: Arc<ServiceState>,
     progress_offset: usize,
+    exclude_prefixes: &[String],
 ) -> Result<BootstrapIndex> {
     if index_path.exists() {
         let loaded = load_index(index_path)
             .with_context(|| format!("failed to read {}", index_path.display()))?;
         if loaded.drive.eq_ignore_ascii_case(drive) {
+            let mut loaded = loaded;
+            loaded.apply_exclude_prefixes(exclude_prefixes);
             service_state
                 .indexed_entries
                 .store(progress_offset + loaded.entries.len(), Ordering::Relaxed);
@@ -538,7 +560,8 @@ fn load_or_build_index(
     }
 
     let started = Instant::now();
-    let index = build_index_with_progress(drive, logger, Some(service_state), progress_offset)?;
+    let mut index = build_index_with_progress(drive, logger, Some(service_state), progress_offset)?;
+    index.apply_exclude_prefixes(exclude_prefixes);
     log_info(
         logger,
         format!(
@@ -671,6 +694,7 @@ fn run_watch_loop(
     index_path: PathBuf,
     poll_ms: u64,
     persist_every_changes: usize,
+    exclude_prefixes: &[String],
     logger: SharedLog,
 ) {
     let sleep = Duration::from_millis(poll_ms);
@@ -689,6 +713,11 @@ fn run_watch_loop(
                     if changed > 0 {
                         changed_now = changed;
                         since_persist += changed;
+                        let excluded = guard.apply_exclude_prefixes(exclude_prefixes);
+                        if excluded > 0 {
+                            changed_now += excluded;
+                            since_persist += excluded;
+                        }
                         if since_persist >= persist_every_changes {
                             since_persist = 0;
                             snapshot_to_save = Some(guard.clone());
@@ -735,6 +764,7 @@ fn run_auto_drive_monitor(
     logger: SharedLog,
     index_base: Option<PathBuf>,
     trigram: bool,
+    exclude_prefixes: Arc<Vec<String>>,
 ) {
     while running.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_secs(60));
@@ -742,7 +772,7 @@ fn run_auto_drive_monitor(
             break;
         }
 
-        let detected = match detect_fixed_ntfs_drives() {
+        let detected = match detect_fixed_drives() {
             Ok(drives) => drives,
             Err(err) => {
                 log_error(&logger, format!("auto-drive detect failed: {err:#}"));
@@ -765,6 +795,8 @@ fn run_auto_drive_monitor(
                             if trigram {
                                 index.set_trigram_enabled(true);
                             }
+                            let mut index = index;
+                            index.apply_exclude_prefixes(&exclude_prefixes);
                             Some(index)
                         } else {
                             None
@@ -780,6 +812,7 @@ fn run_auto_drive_monitor(
                 Some(index) => index,
                 None => match build_index_with_progress(drive, &logger, None, 0) {
                     Ok(mut index) => {
+                        index.apply_exclude_prefixes(&exclude_prefixes);
                         if trigram {
                             index.set_trigram_enabled(true);
                         }
@@ -844,6 +877,7 @@ fn run_pipe_server(
     running: Arc<AtomicBool>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
+    exclude_prefixes: Arc<Vec<String>>,
     logger: SharedLog,
 ) -> Result<()> {
     while running.load(Ordering::SeqCst) {
@@ -861,6 +895,7 @@ fn run_pipe_server(
         let shared_state = service_state.clone();
         let shared_metrics = metrics.clone();
         let shared_logger = logger.clone();
+        let client_excludes = exclude_prefixes.clone();
         let pipe_raw = pipe.0 as isize;
         thread::spawn(move || {
             let pipe = HANDLE(pipe_raw as *mut c_void);
@@ -869,6 +904,7 @@ fn run_pipe_server(
                 shared_state,
                 shared_metrics,
                 default_limit,
+                &client_excludes,
                 shared_logger.clone(),
             ) {
                 log_error(&shared_logger, format!("pipe client error: {err:#}"));
@@ -930,6 +966,7 @@ fn handle_pipe_client(
     service_state: Arc<ServiceState>,
     metrics: Arc<Mutex<ServiceMetrics>>,
     default_limit: usize,
+    exclude_prefixes: &[String],
     _logger: SharedLog,
 ) -> Result<()> {
     let owned = unsafe { OwnedHandle::from_raw_handle(pipe.0 as *mut _) };
@@ -1015,6 +1052,7 @@ fn handle_pipe_client(
                     query: request.query,
                     extension: request.extension,
                     under_dir: request.under_dir,
+                    exclude_prefixes: exclude_prefixes.to_vec(),
                     glob: request.glob,
                     directories_only: request.directories_only,
                     files_only: request.files_only,
@@ -1082,6 +1120,15 @@ fn handle_pipe_client(
                         for item in content_result.matches {
                             if collected.len() >= limit {
                                 break;
+                            }
+                            let path_lower = item.path.to_ascii_lowercase();
+                            let excluded = exclude_prefixes.iter().any(|prefix| {
+                                let normalized = prefix.to_ascii_lowercase();
+                                path_lower == normalized
+                                    || path_lower.starts_with(&format!("{normalized}\\"))
+                            });
+                            if excluded {
+                                continue;
                             }
                             collected.push(QueryResultDto {
                                 path: item.path,

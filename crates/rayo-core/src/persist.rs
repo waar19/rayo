@@ -1,11 +1,13 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
 use crate::index::FileIndex;
+
+const INDEX_ZSTD_MAGIC: &[u8; 8] = b"RAYOZST1";
 
 pub fn save_index(index: &FileIndex, path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
@@ -16,9 +18,25 @@ pub fn save_index(index: &FileIndex, path: impl AsRef<Path>) -> Result<()> {
     let temp_path = build_temp_index_path(path);
     let file = File::create(&temp_path)
         .with_context(|| format!("failed to create temp file {}", temp_path.display()))?;
+    let encoded = bincode::serialize(index).with_context(|| {
+        format!(
+            "failed to serialize index into intermediate buffer {}",
+            temp_path.display()
+        )
+    })?;
+    let compressed = zstd::stream::encode_all(encoded.as_slice(), 1).with_context(|| {
+        format!(
+            "failed to compress index payload into {}",
+            temp_path.display()
+        )
+    })?;
     let mut writer = BufWriter::new(file);
-    bincode::serialize_into(&mut writer, index)
-        .with_context(|| format!("failed to serialize index into {}", temp_path.display()))?;
+    writer
+        .write_all(INDEX_ZSTD_MAGIC)
+        .with_context(|| format!("failed to write header {}", temp_path.display()))?;
+    writer
+        .write_all(&compressed)
+        .with_context(|| format!("failed to write compressed payload {}", temp_path.display()))?;
     writer
         .flush()
         .with_context(|| format!("failed to flush buffer {}", temp_path.display()))?;
@@ -48,9 +66,15 @@ pub fn save_index(index: &FileIndex, path: impl AsRef<Path>) -> Result<()> {
 
 pub fn load_index(path: impl AsRef<Path>) -> Result<FileIndex> {
     let path = path.as_ref();
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut index: FileIndex = bincode::deserialize_from(reader)
+    let payload =
+        std::fs::read(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let decoded = if payload.starts_with(INDEX_ZSTD_MAGIC) {
+        zstd::stream::decode_all(&payload[INDEX_ZSTD_MAGIC.len()..])
+            .with_context(|| format!("failed to decompress compressed index {}", path.display()))?
+    } else {
+        payload
+    };
+    let mut index: FileIndex = bincode::deserialize(&decoded)
         .with_context(|| format!("failed to deserialize index at {}", path.display()))?;
     index.rebuild_search_arena();
     Ok(index)
@@ -72,6 +96,7 @@ fn build_temp_index_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Write;
 
     use crate::{FileEntry, FileIndex};
 
@@ -157,5 +182,40 @@ mod tests {
         assert_eq!(loaded.journal_id, 11);
         assert_eq!(loaded.entries.len(), 2);
         assert!(loaded.entries.contains_key(&2));
+    }
+
+    #[test]
+    fn load_index_supports_legacy_uncompressed_format() {
+        let mut entries = HashMap::new();
+        entries.insert(
+            1,
+            FileEntry {
+                frn: 1,
+                parent_frn: 1,
+                name: "legacy.txt".to_string(),
+                attributes: 0,
+            },
+        );
+        let mut index = FileIndex {
+            drive: "C:".to_string(),
+            entries,
+            journal_id: 1,
+            next_usn: 2,
+            indexed_at_epoch_secs: 3,
+            search_arena: SearchArena::default(),
+            trigram_index: None,
+        };
+        index.rebuild_search_arena();
+
+        let legacy_bytes = bincode::serialize(&index).expect("serialize");
+        let path = std::env::temp_dir().join("rayo-legacy-uncompressed.rayo");
+        let mut file = std::fs::File::create(&path).expect("create file");
+        file.write_all(&legacy_bytes).expect("write");
+        file.flush().expect("flush");
+
+        let loaded = load_index(&path).expect("load legacy");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.journal_id, 1);
     }
 }

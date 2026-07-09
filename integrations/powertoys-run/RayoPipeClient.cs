@@ -25,6 +25,7 @@ public sealed class RayoPipeClient
         int limit = 20,
         string? mode = null,
         int? timeoutMs = null,
+        bool fuzzy = false,
         CancellationToken cancellationToken = default
     )
     {
@@ -47,7 +48,7 @@ public sealed class RayoPipeClient
             TimeoutMs = timeoutMs,
             DirectoriesOnly = false,
             FilesOnly = false,
-            Fuzzy = false,
+            Fuzzy = fuzzy,
         };
 
         var json = JsonSerializer.Serialize(request, JsonOptions);

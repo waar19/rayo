@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
+use ignore::WalkBuilder;
 use memchr::memmem::Finder;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -280,7 +281,10 @@ impl FileIndex {
         progress_counter: Option<&AtomicUsize>,
     ) -> Result<Self> {
         let drive = normalize_drive(drive)?;
-        let snapshot = enumerate_mft_with_progress(&drive, progress_counter)?;
+        let snapshot = match enumerate_mft_with_progress(&drive, progress_counter) {
+            Ok(snapshot) => snapshot,
+            Err(_) => enumerate_with_walk_fallback(&drive, progress_counter)?,
+        };
         let mut index = Self {
             drive,
             entries: snapshot.entries,
@@ -298,6 +302,10 @@ impl FileIndex {
     }
 
     pub fn apply_journal_changes(&mut self) -> Result<usize> {
+        if self.journal_id == 0 {
+            // Non-NTFS fallback snapshot has no USN journal.
+            return Ok(0);
+        }
         let changes = collect_changes(&self.drive, self.journal_id, self.next_usn)?;
         for change in &changes.events {
             match change {
@@ -323,6 +331,46 @@ impl FileIndex {
             self.rebuild_trigram_index();
         }
         Ok(changes.events.len())
+    }
+
+    pub fn apply_exclude_prefixes(&mut self, prefixes: &[String]) -> usize {
+        let matchers = prefixes
+            .iter()
+            .filter_map(|prefix| build_under_matcher(prefix))
+            .collect::<Vec<_>>();
+        if matchers.is_empty() {
+            return 0;
+        }
+
+        let to_remove = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|frn| {
+                self.resolve_path(*frn)
+                    .map(|path| {
+                        let lower = path.to_ascii_lowercase();
+                        matchers.iter().any(|matcher| {
+                            lower == matcher.exact || lower.starts_with(&matcher.prefix)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        for frn in &to_remove {
+            self.entries.remove(frn);
+            self.search_arena.delete_frn(*frn);
+        }
+        if !to_remove.is_empty() {
+            if self.search_arena.should_compact() {
+                self.rebuild_search_arena();
+            }
+            if self.trigram_index.is_some() {
+                self.rebuild_trigram_index();
+            }
+        }
+        to_remove.len()
     }
 
     pub fn rebuild_search_arena(&mut self) {
@@ -399,6 +447,11 @@ impl FileIndex {
             .under_dir
             .as_ref()
             .and_then(|raw| build_under_matcher(raw));
+        let excludes = options
+            .exclude_prefixes
+            .iter()
+            .filter_map(|raw| build_under_matcher(raw))
+            .collect::<Vec<_>>();
         let glob_matcher = options
             .glob
             .as_ref()
@@ -456,6 +509,11 @@ impl FileIndex {
                     continue;
                 }
             }
+            if excludes.iter().any(|matcher| {
+                path_lower == matcher.exact || path_lower.starts_with(&matcher.prefix)
+            }) {
+                continue;
+            }
             if let Some(matcher) = &glob_matcher {
                 let normalized_glob_path = path.replace('\\', "/");
                 if !matcher.is_match(&normalized_glob_path) {
@@ -497,6 +555,89 @@ impl FileIndex {
 
 fn is_ntfs_root_reference(frn: u64) -> bool {
     (frn & NTFS_FILE_REFERENCE_INDEX_MASK) == NTFS_ROOT_DIRECTORY_INDEX
+}
+
+fn enumerate_with_walk_fallback(
+    drive: &str,
+    progress_counter: Option<&AtomicUsize>,
+) -> Result<MftSnapshot> {
+    let root = format!("{drive}\\");
+    let mut entries = HashMap::new();
+    let mut path_to_frn: HashMap<String, u64> = HashMap::new();
+    path_to_frn.insert(root.to_ascii_lowercase(), NTFS_ROOT_DIRECTORY_INDEX);
+    let mut next_frn = NTFS_ROOT_DIRECTORY_INDEX + 1;
+
+    let mut walker = WalkBuilder::new(&root);
+    walker
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false);
+    for item in walker.build() {
+        let Ok(entry) = item else {
+            continue;
+        };
+        let path = entry.path();
+        if path == Path::new(&root) {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string())
+        else {
+            continue;
+        };
+
+        let parent_path = path
+            .parent()
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .replace('/', "\\")
+                    .to_ascii_lowercase()
+            })
+            .unwrap_or_else(|| root.to_ascii_lowercase());
+        let parent_frn = path_to_frn
+            .get(&parent_path)
+            .copied()
+            .unwrap_or(NTFS_ROOT_DIRECTORY_INDEX);
+
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let attributes = if metadata.is_dir() { 0x10 } else { 0 };
+        let frn = next_frn;
+        next_frn = next_frn.saturating_add(1);
+        entries.insert(
+            frn,
+            FileEntry {
+                frn,
+                parent_frn,
+                name,
+                attributes,
+            },
+        );
+
+        if metadata.is_dir() {
+            let current_path = path
+                .to_string_lossy()
+                .replace('/', "\\")
+                .to_ascii_lowercase();
+            path_to_frn.insert(current_path, frn);
+        }
+        if let Some(counter) = progress_counter {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    Ok(MftSnapshot {
+        entries,
+        next_usn: 0,
+        journal_id: 0,
+    })
 }
 
 fn build_glob(pattern: &str) -> Result<GlobMatcher> {
@@ -648,6 +789,7 @@ pub struct SearchOptions {
     pub query: String,
     pub extension: Option<String>,
     pub under_dir: Option<String>,
+    pub exclude_prefixes: Vec<String>,
     pub glob: Option<String>,
     pub directories_only: bool,
     pub files_only: bool,
@@ -780,6 +922,7 @@ mod tests {
             query: "main".to_string(),
             extension: Some("rs".to_string()),
             under_dir: Some("C:\\src".to_string()),
+            exclude_prefixes: Vec::new(),
             glob: Some("**/*.rs".to_string()),
             directories_only: false,
             files_only: true,
@@ -892,6 +1035,7 @@ mod tests {
             query: "main".to_string(),
             extension: None,
             under_dir: Some("C:\\src".to_string()),
+            exclude_prefixes: Vec::new(),
             glob: None,
             directories_only: false,
             files_only: true,
@@ -951,6 +1095,7 @@ mod tests {
             query: "report".to_string(),
             extension: Some("pdf".to_string()),
             under_dir: Some("C:\\Reports".to_string()),
+            exclude_prefixes: Vec::new(),
             glob: None,
             directories_only: false,
             files_only: true,

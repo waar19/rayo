@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use rayo_core::{
-    ContentSearchOptions, FileIndex, SearchOptions, is_running_as_admin, load_index,
-    normalize_drive, save_index, search_content,
+    ContentSearchOptions, FileIndex, SearchOptions, SyntaxSearchOptions, is_running_as_admin,
+    load_index, normalize_drive, save_index, search_content, search_syntax,
 };
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
@@ -31,6 +31,8 @@ enum Commands {
         drive: String,
         #[arg(long, default_value = "index.rayo")]
         output: PathBuf,
+        #[arg(long)]
+        exclude: Option<String>,
     },
     /// Search inside an existing index
     Search {
@@ -44,6 +46,8 @@ enum Commands {
         under: Option<String>,
         #[arg(long)]
         glob: Option<String>,
+        #[arg(long)]
+        exclude: Option<String>,
         #[arg(long, default_value_t = false)]
         dirs_only: bool,
         #[arg(long, default_value_t = false)]
@@ -66,12 +70,29 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
+    /// Syntax-aware code search using tree-sitter
+    Syntax {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        under: PathBuf,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long)]
+        node_kind: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value_t = 3000)]
+        timeout_ms: u64,
+    },
     /// Keep index up to date from USN Journal
     Watch {
         #[arg(long, default_value = "C")]
         drive: String,
         #[arg(long, default_value = "index.rayo")]
         index: PathBuf,
+        #[arg(long)]
+        exclude: Option<String>,
         #[arg(long, default_value_t = 500)]
         poll_ms: u64,
     },
@@ -111,6 +132,8 @@ enum ServiceAction {
         index: Option<PathBuf>,
         #[arg(long)]
         log_file: Option<PathBuf>,
+        #[arg(long)]
+        exclude: Option<String>,
     },
     Uninstall,
     Status,
@@ -119,20 +142,25 @@ enum ServiceAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Index { drive, output } => run_index(&drive, output),
+        Commands::Index {
+            drive,
+            output,
+            exclude,
+        } => run_index(&drive, output, exclude),
         Commands::Search {
             index,
             query,
             ext,
             under,
             glob,
+            exclude,
             dirs_only,
             files_only,
             limit,
             trigram,
             fuzzy,
         } => run_search(
-            index, query, ext, under, glob, dirs_only, files_only, limit, trigram, fuzzy,
+            index, query, ext, under, glob, exclude, dirs_only, files_only, limit, trigram, fuzzy,
         ),
         Commands::Content {
             query,
@@ -140,19 +168,29 @@ fn main() -> Result<()> {
             ext,
             limit,
         } => run_content_search(query, under, ext, limit),
+        Commands::Syntax {
+            query,
+            under,
+            language,
+            node_kind,
+            limit,
+            timeout_ms,
+        } => run_syntax_search(query, under, language, node_kind, limit, timeout_ms),
         Commands::Watch {
             drive,
             index,
+            exclude,
             poll_ms,
-        } => run_watch(&drive, index, poll_ms),
+        } => run_watch(&drive, index, exclude, poll_ms),
         Commands::Shell { action } => run_shell(action),
         Commands::Service { action } => run_service(action),
     }
 }
 
-fn run_index(drive: &str, output: PathBuf) -> Result<()> {
+fn run_index(drive: &str, output: PathBuf, exclude: Option<String>) -> Result<()> {
     require_admin()?;
     let drives = parse_drive_list(drive)?;
+    let exclude_prefixes = parse_exclude_list(exclude.as_deref());
     let multi_drive = drives.len() > 1;
     let started = Instant::now();
     println!(
@@ -163,11 +201,13 @@ fn run_index(drive: &str, output: PathBuf) -> Result<()> {
         let output_path = drive_index_path(&output, &drive, multi_drive);
         println!("Building index for {}...", drive);
         let build_started = Instant::now();
-        let index = build_index_with_progress(&drive)?;
+        let mut index = build_index_with_progress(&drive)?;
+        let excluded = index.apply_exclude_prefixes(&exclude_prefixes);
         println!(
-            "MFT/journal scan for {} completed in {:?}. Saving index...",
+            "MFT/journal scan for {} completed in {:?}. Excluded {} entries. Saving index...",
             drive,
-            build_started.elapsed()
+            build_started.elapsed(),
+            excluded
         );
         let save_started = Instant::now();
         save_index(&index, &output_path)?;
@@ -190,6 +230,7 @@ fn run_search(
     ext: Option<String>,
     under: Option<String>,
     glob: Option<String>,
+    exclude: Option<String>,
     dirs_only: bool,
     files_only: bool,
     limit: usize,
@@ -198,11 +239,13 @@ fn run_search(
 ) -> Result<()> {
     let mut index = load_index(&index_path)?;
     index.set_trigram_enabled(trigram);
+    let exclude_prefixes = parse_exclude_list(exclude.as_deref());
     let started = Instant::now();
     let results = index.search(&SearchOptions {
         query,
         extension: ext,
         under_dir: under,
+        exclude_prefixes,
         glob,
         directories_only: dirs_only,
         files_only,
@@ -246,9 +289,53 @@ fn run_content_search(
     Ok(())
 }
 
-fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
+fn run_syntax_search(
+    query: String,
+    under: PathBuf,
+    language: Option<String>,
+    node_kind: Option<String>,
+    limit: usize,
+    timeout_ms: u64,
+) -> Result<()> {
+    let outcome = search_syntax(&SyntaxSearchOptions {
+        query,
+        under_dir: Some(under),
+        language,
+        node_kind,
+        limit,
+        timeout: Duration::from_millis(timeout_ms.max(100)),
+    })?;
+
+    for item in &outcome.matches {
+        println!(
+            "{}:{}:{} [{}:{}] {}",
+            item.path,
+            item.line_number,
+            item.column_number,
+            item.language,
+            item.node_kind,
+            item.snippet
+        );
+    }
+    println!(
+        "Syntax results: {} in {:?} (scanned={} timed_out={})",
+        outcome.matches.len(),
+        outcome.took,
+        outcome.scanned_files,
+        outcome.timed_out
+    );
+    Ok(())
+}
+
+fn run_watch(
+    drive: &str,
+    index_path: PathBuf,
+    exclude: Option<String>,
+    poll_ms: u64,
+) -> Result<()> {
     require_admin()?;
     let drive = normalize_drive(drive)?;
+    let exclude_prefixes = parse_exclude_list(exclude.as_deref());
     println!(
         "Preparing watch on {}. Initial bootstrap can take time...",
         drive
@@ -273,6 +360,10 @@ fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
         );
         build_index_with_progress(&drive)?
     };
+    let excluded = index.apply_exclude_prefixes(&exclude_prefixes);
+    if excluded > 0 {
+        println!("Excluded {excluded} entries before starting watch.");
+    }
     println!("Saving initial watch snapshot...");
     save_index(&index, &index_path)?;
     println!(
@@ -290,11 +381,12 @@ fn run_watch(drive: &str, index_path: PathBuf, poll_ms: u64) -> Result<()> {
     let sleep = Duration::from_millis(poll_ms.max(50));
     while running.load(Ordering::SeqCst) {
         let changed = index.apply_journal_changes()?;
-        if changed > 0 {
+        let excluded = index.apply_exclude_prefixes(&exclude_prefixes);
+        if changed > 0 || excluded > 0 {
             save_index(&index, &index_path)?;
             println!(
-                "Updated: {changed} changes applied. Total: {}",
-                index.entries.len()
+                "Updated: {changed} changes + {excluded} excluded. Total: {}",
+                index.entries.len(),
             );
         }
         std::thread::sleep(sleep);
@@ -369,6 +461,16 @@ fn parse_drive_list(raw: &str) -> Result<Vec<String>> {
     Ok(drives)
 }
 
+fn parse_exclude_list(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .map(|value| value.trim().replace('/', "\\"))
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 fn service_install_drives_arg(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.eq_ignore_ascii_case("auto") {
@@ -415,7 +517,8 @@ fn run_service(action: ServiceAction) -> Result<()> {
             drives,
             index,
             log_file,
-        } => run_service_install(service_exe, drives, index, log_file),
+            exclude,
+        } => run_service_install(service_exe, drives, index, log_file, exclude),
         ServiceAction::Uninstall => run_service_uninstall(),
         ServiceAction::Status => run_service_status(),
     }
@@ -426,6 +529,7 @@ fn run_service_install(
     drives_raw: String,
     index: Option<PathBuf>,
     log_file: Option<PathBuf>,
+    exclude: Option<String>,
 ) -> Result<()> {
     if !is_running_as_admin() {
         println!("Service install requires Administrator privileges. Requesting elevation...");
@@ -447,6 +551,10 @@ fn run_service_install(
             args.push("--log-file".to_string());
             args.push(path.display().to_string());
         }
+        if let Some(value) = &exclude {
+            args.push("--exclude".to_string());
+            args.push(value.clone());
+        }
         relaunch_self_elevated(&args)?;
         return Ok(());
     }
@@ -455,6 +563,7 @@ fn run_service_install(
     let service_path = resolve_service_exe_path(service_exe)?;
     let index_base = index.unwrap_or_else(default_background_index_base_path);
     let log_path = log_file.unwrap_or_else(default_background_log_path);
+    let exclude_csv = exclude.unwrap_or_default();
 
     if let Some(parent) = index_base.parent() {
         std::fs::create_dir_all(parent)?;
@@ -463,8 +572,13 @@ fn run_service_install(
         std::fs::create_dir_all(parent)?;
     }
 
-    let task_command =
-        build_service_task_command(&service_path, &drives_csv, &index_base, &log_path);
+    let task_command = build_service_task_command(
+        &service_path,
+        &drives_csv,
+        &index_base,
+        &log_path,
+        &exclude_csv,
+    );
     run_schtasks(&[
         "/create",
         "/tn",
@@ -576,14 +690,19 @@ fn build_service_task_command(
     drives_csv: &str,
     index_base: &Path,
     log_path: &Path,
+    exclude_csv: &str,
 ) -> String {
-    format!(
+    let mut command = format!(
         "\"{}\" --drives {} --index \"{}\" --log-file \"{}\"",
         service_exe.display(),
         drives_csv,
         index_base.display(),
         log_path.display()
-    )
+    );
+    if !exclude_csv.trim().is_empty() {
+        command.push_str(&format!(" --exclude \"{}\"", exclude_csv.replace('"', "")));
+    }
+    command
 }
 
 fn resolve_service_exe_path(service_exe: Option<PathBuf>) -> Result<PathBuf> {

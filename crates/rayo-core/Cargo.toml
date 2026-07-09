@@ -1,6 +1,6 @@
 [package]
 name = "rayo-core"
-version = "0.4.1"
+version = "0.7.0"
 edition.workspace = true
 license.workspace = true
 description.workspace = true
@@ -18,3 +18,9 @@ rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 windows.workspace = true
+zstd.workspace = true
+tree-sitter = "0.26.10"
+tree-sitter-rust = "0.24.2"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"

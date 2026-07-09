@@ -3,21 +3,28 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text.Json;
+using System.Windows.Controls;
+using Microsoft.PowerToys.Settings.UI.Library;
 using System.Windows;
 using System.Windows.Input;
 using Wox.Plugin;
 
 namespace Community.PowerToys.Run.Plugin.Rayo;
 
-public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
+public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu, ISettingProvider
 {
     public static string PluginID => "F8074EA2F6CF4A3A8D996BBA5F95F185";
     private const string BackgroundTaskName = "Rayo Service";
     private const string ServiceProcessName = "rayo-service";
     private const string ServiceExecutableName = "rayo-service.exe";
     private const string ServicePathEnvironmentVariable = "RAYO_SERVICE_PATH";
-    private const string PluginVersion = "0.4.1";
+    private const string PluginVersion = "0.7.0";
     private const string ReleasesLatestApi = "https://api.github.com/repos/waar19/rayo/releases/latest";
+    private const string SettingMaxResults = "max_results";
+    private const string SettingContentTimeoutMs = "content_timeout_ms";
+    private const string SettingFuzzyEnabled = "fuzzy_enabled";
+    private const string SettingAppsEnabled = "apps_enabled";
+    private const string SettingResultScoreBase = "result_score_base";
     private static readonly HttpClient UpdateHttpClient = new() { Timeout = TimeSpan.FromSeconds(4) };
     private static readonly TimeSpan AppCatalogTtl = TimeSpan.FromMinutes(10);
 
@@ -31,11 +38,105 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
     private readonly object _appCatalogLock = new();
     private List<AppEntry> _appCatalog = [];
     private DateTimeOffset _appCatalogBuiltAt = DateTimeOffset.MinValue;
+    private int _maxResults = 20;
+    private int _contentTimeoutMs = 3_000;
+    private bool _fuzzyEnabled;
+    private bool _appsEnabled = true;
+    private int _resultScoreBase = 10_000;
 
     public void Init(PluginInitContext context)
     {
         _pluginContext = context;
         StartUpdateCheck();
+    }
+
+    public IEnumerable<PluginAdditionalOption> AdditionalOptions => new List<PluginAdditionalOption>
+    {
+        new()
+        {
+            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Numberbox,
+            Key = SettingMaxResults,
+            DisplayLabel = "Maximum results",
+            DisplayDescription = "Maximum number of items returned per search.",
+            NumberValue = _maxResults,
+            NumberBoxMin = 5,
+            NumberBoxMax = 100,
+            NumberBoxSmallChange = 1,
+            NumberBoxLargeChange = 5,
+        },
+        new()
+        {
+            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Numberbox,
+            Key = SettingContentTimeoutMs,
+            DisplayLabel = "Content timeout (ms)",
+            DisplayDescription = "Timeout for content-mode searches.",
+            NumberValue = _contentTimeoutMs,
+            NumberBoxMin = 200,
+            NumberBoxMax = 10000,
+            NumberBoxSmallChange = 100,
+            NumberBoxLargeChange = 500,
+        },
+        new()
+        {
+            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Checkbox,
+            Key = SettingFuzzyEnabled,
+            DisplayLabel = "Enable fuzzy search",
+            DisplayDescription = "Uses fuzzy ranking for name searches.",
+            Value = _fuzzyEnabled,
+        },
+        new()
+        {
+            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Checkbox,
+            Key = SettingAppsEnabled,
+            DisplayLabel = "Include app results",
+            DisplayDescription = "Adds Start Menu and WindowsApps matches.",
+            Value = _appsEnabled,
+        },
+        new()
+        {
+            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Numberbox,
+            Key = SettingResultScoreBase,
+            DisplayLabel = "Result base score",
+            DisplayDescription = "Base score used to rank Rayo file results.",
+            NumberValue = _resultScoreBase,
+            NumberBoxMin = 500,
+            NumberBoxMax = 100000,
+            NumberBoxSmallChange = 100,
+            NumberBoxLargeChange = 1000,
+        },
+    };
+
+    public Control CreateSettingPanel()
+    {
+        throw new NotImplementedException();
+    }
+
+    public void UpdateSettings(PowerLauncherPluginSettings settings)
+    {
+        if (settings?.AdditionalOptions is null)
+        {
+            return;
+        }
+
+        _maxResults = ClampIntSetting(settings, SettingMaxResults, _maxResults, 5, 100);
+        _contentTimeoutMs = ClampIntSetting(
+            settings,
+            SettingContentTimeoutMs,
+            _contentTimeoutMs,
+            200,
+            10_000
+        );
+        _resultScoreBase = ClampIntSetting(
+            settings,
+            SettingResultScoreBase,
+            _resultScoreBase,
+            500,
+            100_000
+        );
+        _fuzzyEnabled = settings.AdditionalOptions.FirstOrDefault(x => x.Key == SettingFuzzyEnabled)?.Value
+            ?? _fuzzyEnabled;
+        _appsEnabled = settings.AdditionalOptions.FirstOrDefault(x => x.Key == SettingAppsEnabled)?.Value
+            ?? _appsEnabled;
     }
 
     public List<Result> Query(Query query)
@@ -72,7 +173,13 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
         try
         {
             var response = _pipeClient
-                .QueryAsync(input, limit: 20, mode: mode, timeoutMs: mode == "content" ? 3_000 : null)
+                .QueryAsync(
+                    input,
+                    limit: _maxResults,
+                    mode: mode,
+                    timeoutMs: mode == "content" ? _contentTimeoutMs : null,
+                    fuzzy: _fuzzyEnabled
+                )
                 .GetAwaiter()
                 .GetResult();
             if (response is null)
@@ -89,7 +196,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             }
 
             var mapped = new List<Result>(response.Results.Count);
-            var scoreBase = isGlobalQuery ? 100 : 10_000;
+            var scoreBase = isGlobalQuery ? Math.Clamp(_resultScoreBase / 100, 10, 500) : _resultScoreBase;
             var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             for (var idx = 0; idx < response.Results.Count; idx++)
             {
@@ -119,12 +226,12 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
                 });
             }
 
-            if (!string.Equals(mode, "content", StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(mode, "content", StringComparison.OrdinalIgnoreCase) && _appsEnabled)
             {
                 mapped.AddRange(BuildAppResults(input, isGlobalQuery, mapped.Count, seenPaths));
-                if (mapped.Count > 20)
+                if (mapped.Count > _maxResults)
                 {
-                    mapped = mapped.Take(20).ToList();
+                    mapped = mapped.Take(_maxResults).ToList();
                 }
             }
 
@@ -152,6 +259,23 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             return $"{item.Path}:{item.LineNumber}{excerpt}";
         }
         return item.Path;
+    }
+
+    private static int ClampIntSetting(
+        PowerLauncherPluginSettings settings,
+        string key,
+        int fallback,
+        int min,
+        int max
+    )
+    {
+        var option = settings.AdditionalOptions?.FirstOrDefault(x => x.Key == key);
+        if (option is null)
+        {
+            return fallback;
+        }
+        var parsed = (int)Math.Round(option.NumberValue, MidpointRounding.AwayFromZero);
+        return Math.Clamp(parsed, min, max);
     }
 
     private static string ResolveItemIconPath(QueryResultItem item)
@@ -188,7 +312,7 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             return [];
         }
 
-        var appLimit = Math.Clamp(20 - existingCount, 0, 8);
+        var appLimit = Math.Clamp(_maxResults - existingCount, 0, 8);
         if (appLimit == 0)
         {
             return [];
@@ -200,7 +324,9 @@ public sealed class Main : IPlugin, IDelayedExecutionPlugin, IContextMenu
             return [];
         }
 
-        var scoreBase = isGlobalQuery ? 90 : 9_000;
+        var scoreBase = isGlobalQuery
+            ? Math.Clamp((_resultScoreBase / 100) - 10, 1, 500)
+            : Math.Max(1, _resultScoreBase - 1_000);
         var mapped = new List<Result>(apps.Count);
         for (var idx = 0; idx < apps.Count; idx++)
         {

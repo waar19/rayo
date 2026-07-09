@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -31,6 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     ShowWindow, TranslateMessage, WM_HOTKEY,
 };
 use windows::core::PCWSTR;
+use winreg::RegKey;
+use winreg::enums::HKEY_CURRENT_USER;
 
 slint::include_modules!();
 
@@ -38,6 +41,7 @@ const DEFAULT_PIPE: &str = r"\\.\pipe\rayo-query";
 const RAYO_GUI_MUTEX_NAME: &str = "Global\\RayoGuiSingleton";
 const RAYO_HOTKEY_ID: i32 = 0x5261;
 const RELEASES_LATEST_API: &str = "https://api.github.com/repos/waar19/rayo/releases/latest";
+const APP_CATALOG_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Rayo GUI search client")]
@@ -76,6 +80,8 @@ struct QueryRequest {
 struct QueryResultDto {
     path: String,
     is_directory: bool,
+    #[serde(default)]
+    is_app: bool,
     line_number: Option<u64>,
     line_text: Option<String>,
 }
@@ -157,6 +163,9 @@ struct GuiSettings {
     debounce_ms: u64,
     content_mode: bool,
     fuzzy_mode: bool,
+    apps_mode: bool,
+    theme_auto: bool,
+    light_theme: bool,
 }
 
 impl Default for GuiSettings {
@@ -170,15 +179,41 @@ impl Default for GuiSettings {
             debounce_ms: 10,
             content_mode: false,
             fuzzy_mode: false,
+            apps_mode: true,
+            theme_auto: true,
+            light_theme: false,
         }
     }
 }
 
+#[derive(Debug, Clone)]
+struct AppEntry {
+    display_name: String,
+    launch_path: String,
+}
+
+#[derive(Default)]
+struct AppCatalogCache {
+    built_at: Option<Instant>,
+    entries: Vec<AppEntry>,
+}
+
 struct UiPayload {
-    rows: Vec<ResultRow>,
+    rows: Vec<UiRowData>,
     paths: Vec<String>,
     status_text: String,
     mode_text: String,
+}
+
+#[derive(Clone)]
+struct UiRowData {
+    kind: String,
+    name: String,
+    path: String,
+    subtitle: String,
+    is_directory: bool,
+    is_app: bool,
+    line_match: bool,
 }
 
 #[derive(Debug)]
@@ -255,8 +290,16 @@ fn settings_hint(settings: &GuiSettings) -> String {
         "name"
     };
     let fuzzy = if settings.fuzzy_mode { "on" } else { "off" };
+    let apps = if settings.apps_mode { "on" } else { "off" };
+    let theme = if settings.theme_auto {
+        "auto"
+    } else if settings.light_theme {
+        "light"
+    } else {
+        "dark"
+    };
     format!(
-        "search={search_mode} scope={scope} ext={extension} mode={mode} fuzzy={fuzzy} limit={} debounce={}ms",
+        "search={search_mode} scope={scope} ext={extension} mode={mode} fuzzy={fuzzy} apps={apps} theme={theme} limit={} debounce={}ms",
         settings.limit, settings.debounce_ms
     )
 }
@@ -279,6 +322,18 @@ fn validate_settings(settings: &GuiSettings) -> Option<String> {
 fn settings_path() -> Result<PathBuf> {
     let app_data = std::env::var("APPDATA").context("APPDATA environment variable is not set")?;
     Ok(PathBuf::from(app_data).join("rayo").join("settings.json"))
+}
+
+fn detect_system_light_theme() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key =
+        match hkcu.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") {
+            Ok(key) => key,
+            Err(_) => return false,
+        };
+    key.get_value::<u32, _>("AppsUseLightTheme")
+        .map(|value| value != 0)
+        .unwrap_or(false)
 }
 
 fn load_settings() -> Result<(GuiSettings, Option<String>)> {
@@ -432,8 +487,23 @@ fn read_settings(settings: &Arc<RwLock<GuiSettings>>) -> GuiSettings {
     }
 }
 
+thread_local! {
+    static UI_ICON_CACHE: RefCell<HashMap<String, slint::Image>> = RefCell::new(HashMap::new());
+}
+
 fn apply_payload(ui: &MainWindow, payload: UiPayload, paths: &Arc<Mutex<Vec<String>>>) {
-    let model = Rc::new(VecModel::from(payload.rows));
+    let rows = payload
+        .rows
+        .into_iter()
+        .map(|row| ResultRow {
+            icon: resolve_ui_row_icon(&row),
+            kind: row.kind.into(),
+            name: row.name.into(),
+            path: row.path.into(),
+            subtitle: row.subtitle.into(),
+        })
+        .collect::<Vec<_>>();
+    let model = Rc::new(VecModel::from(rows));
     ui.set_results(ModelRc::from(model));
     ui.set_status_text(payload.status_text.into());
     ui.set_mode_text(payload.mode_text.into());
@@ -722,10 +792,285 @@ fn update_preview_for_selected(ui: &MainWindow, paths: &Arc<Mutex<Vec<String>>>)
     }
 }
 
+fn add_if_dir_exists(roots: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() {
+        roots.push(path);
+    }
+}
+
+fn app_catalog_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(app_data) = std::env::var("APPDATA") {
+        add_if_dir_exists(
+            &mut roots,
+            PathBuf::from(app_data).join("Microsoft\\Windows\\Start Menu\\Programs"),
+        );
+    }
+    if let Ok(program_data) = std::env::var("ProgramData") {
+        add_if_dir_exists(
+            &mut roots,
+            PathBuf::from(program_data).join("Microsoft\\Windows\\Start Menu\\Programs"),
+        );
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        add_if_dir_exists(
+            &mut roots,
+            PathBuf::from(local_app_data).join("Microsoft\\WindowsApps"),
+        );
+    }
+    roots
+}
+
+fn should_include_app_file(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(extension.as_str(), "lnk" | "appref-ms" | "exe")
+}
+
+fn app_display_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?.trim();
+    if stem.is_empty() || stem.to_ascii_lowercase().starts_with("uninstall") {
+        return None;
+    }
+    Some(stem.to_string())
+}
+
+fn build_app_catalog() -> Vec<AppEntry> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for root in app_catalog_roots() {
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let read_dir = match fs::read_dir(&dir) {
+                Ok(read_dir) => read_dir,
+                Err(_) => continue,
+            };
+            for item in read_dir.flatten() {
+                let path = item.path();
+                let metadata = match item.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => continue,
+                };
+                if metadata.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !metadata.is_file() || !should_include_app_file(&path) {
+                    continue;
+                }
+                let Some(display_name) = app_display_name(&path) else {
+                    continue;
+                };
+                let launch_path = path.display().to_string();
+                if seen.insert(launch_path.to_ascii_lowercase()) {
+                    entries.push(AppEntry {
+                        display_name,
+                        launch_path,
+                    });
+                }
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.display_name
+            .to_ascii_lowercase()
+            .cmp(&right.display_name.to_ascii_lowercase())
+    });
+    entries
+}
+
+fn ensure_app_catalog(cache: &Arc<Mutex<AppCatalogCache>>) -> Vec<AppEntry> {
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let now = Instant::now();
+    let fresh = guard
+        .built_at
+        .map(|built_at| now.duration_since(built_at) < APP_CATALOG_TTL)
+        .unwrap_or(false);
+    if !fresh || guard.entries.is_empty() {
+        guard.entries = build_app_catalog();
+        guard.built_at = Some(now);
+    }
+    guard.entries.clone()
+}
+
+fn search_apps(
+    query: &str,
+    limit: usize,
+    seen_paths: &HashSet<String>,
+    cache: &Arc<Mutex<AppCatalogCache>>,
+) -> Vec<QueryResultDto> {
+    if limit == 0 || query.trim().chars().count() < 2 {
+        return Vec::new();
+    }
+    let query_lower = query.to_ascii_lowercase();
+    let mut matches: Vec<(u8, usize, QueryResultDto)> = ensure_app_catalog(cache)
+        .into_iter()
+        .filter(|app| !seen_paths.contains(&app.launch_path.to_ascii_lowercase()))
+        .filter_map(|app| {
+            let name_lower = app.display_name.to_ascii_lowercase();
+            let path_lower = app.launch_path.to_ascii_lowercase();
+            if !name_lower.contains(&query_lower) && !path_lower.contains(&query_lower) {
+                return None;
+            }
+            let starts = if name_lower.starts_with(&query_lower) {
+                0
+            } else {
+                1
+            };
+            let len = app.display_name.len();
+            Some((
+                starts,
+                len,
+                QueryResultDto {
+                    path: app.launch_path,
+                    is_directory: false,
+                    is_app: true,
+                    line_number: None,
+                    line_text: Some(format!("App • {}", app.display_name)),
+                },
+            ))
+        })
+        .collect();
+    matches.sort_by(|(a_starts, a_len, a_item), (b_starts, b_len, b_item)| {
+        a_starts
+            .cmp(b_starts)
+            .then_with(|| a_len.cmp(b_len))
+            .then_with(|| a_item.path.cmp(&b_item.path))
+    });
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, item)| item)
+        .collect()
+}
+
+fn interleave_app_results(
+    mut base: Vec<QueryResultDto>,
+    apps: Vec<QueryResultDto>,
+    limit: usize,
+) -> Vec<QueryResultDto> {
+    if apps.is_empty() {
+        if base.len() > limit {
+            base.truncate(limit);
+        }
+        return base;
+    }
+    let mut output = Vec::with_capacity(limit);
+    let mut base_idx = 0usize;
+    let mut app_idx = 0usize;
+    while output.len() < limit && (base_idx < base.len() || app_idx < apps.len()) {
+        for _ in 0..2 {
+            if output.len() >= limit {
+                break;
+            }
+            if let Some(item) = base.get(base_idx) {
+                output.push(item.clone());
+                base_idx += 1;
+            }
+        }
+        if output.len() >= limit {
+            break;
+        }
+        if let Some(item) = apps.get(app_idx) {
+            output.push(item.clone());
+            app_idx += 1;
+        }
+    }
+    output
+}
+
+fn shell_icon_from_path(path: &str, is_directory: bool) -> Option<slint::Image> {
+    let path_obj = Path::new(path);
+    if path_obj.exists()
+        && let Some(extension) = path_obj.extension().and_then(|value| value.to_str())
+    {
+        let ext = extension.to_ascii_lowercase();
+        if matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "ico"
+        ) && let Ok(image) = slint::Image::load_from_path(path_obj)
+        {
+            return Some(image);
+        }
+    }
+
+    let mut fallbacks = Vec::new();
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(base_dir) = exe_path.parent()
+    {
+        if is_directory {
+            fallbacks.push(base_dir.join("Images\\rayo.folder.png"));
+        } else {
+            fallbacks.push(base_dir.join("Images\\rayo.file.png"));
+        }
+        fallbacks.push(base_dir.join("assets\\rayo.png"));
+    }
+    fallbacks.push(PathBuf::from(
+        "c:\\src\\rayo\\integrations\\powertoys-run\\Images\\rayo.file.png",
+    ));
+    fallbacks.push(PathBuf::from(
+        "c:\\src\\rayo\\crates\\rayo-gui\\ui\\assets\\rayo.png",
+    ));
+
+    for fallback in fallbacks {
+        if fallback.exists()
+            && let Ok(image) = slint::Image::load_from_path(&fallback)
+        {
+            return Some(image);
+        }
+    }
+    None
+}
+
+fn icon_cache_key(path: &str, is_directory: bool, is_app: bool, line_match: bool) -> String {
+    if is_app {
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("app");
+        return format!("app:{}", ext.to_ascii_lowercase());
+    }
+    if is_directory {
+        return "dir".to_string();
+    }
+    if line_match {
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("line");
+        return format!("line:{}", ext.to_ascii_lowercase());
+    }
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("file");
+    format!("file:{}", ext.to_ascii_lowercase())
+}
+
+fn resolve_ui_row_icon(row: &UiRowData) -> slint::Image {
+    let key = icon_cache_key(&row.path, row.is_directory, row.is_app, row.line_match);
+    UI_ICON_CACHE.with(|cache_cell| {
+        let mut cache = cache_cell.borrow_mut();
+        if let Some(image) = cache.get(&key) {
+            return image.clone();
+        }
+        let resolved = shell_icon_from_path(&row.path, row.is_directory).unwrap_or_default();
+        cache.insert(key, resolved.clone());
+        resolved
+    })
+}
+
 fn run_search(
     config: &GuiConfig,
     settings_state: &Arc<RwLock<GuiSettings>>,
     fallback_index: &Arc<RwLock<Option<FileIndex>>>,
+    app_catalog: &Arc<Mutex<AppCatalogCache>>,
     query: String,
     pipe_client: &mut Option<PipeClient>,
 ) -> UiPayload {
@@ -840,6 +1185,7 @@ fn run_search(
                             .map(|item| QueryResultDto {
                                 path: item.path,
                                 is_directory: false,
+                                is_app: false,
                                 line_number: Some(item.line_number),
                                 line_text: Some(item.line_text),
                             })
@@ -864,6 +1210,7 @@ fn run_search(
                     query: trimmed_query.clone(),
                     extension: settings.extension.clone(),
                     under_dir: settings.under_dir.clone(),
+                    exclude_prefixes: Vec::new(),
                     glob: None,
                     directories_only: settings.directories_only,
                     files_only: settings.files_only,
@@ -877,6 +1224,7 @@ fn run_search(
                         .map(|item| QueryResultDto {
                             path: item.path,
                             is_directory: item.is_directory,
+                            is_app: false,
                             line_number: None,
                             line_text: None,
                         })
@@ -889,15 +1237,29 @@ fn run_search(
         }
     };
 
-    let mut rows = Vec::with_capacity(raw_results.len());
-    let mut paths = Vec::with_capacity(raw_results.len());
-    for item in raw_results {
+    let merged_results = if settings.content_mode || !settings.apps_mode {
+        raw_results
+    } else {
+        let seen_paths = raw_results
+            .iter()
+            .map(|item| item.path.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let app_limit = settings.limit.saturating_div(3).clamp(3, 12);
+        let app_results = search_apps(&trimmed_query, app_limit, &seen_paths, app_catalog);
+        interleave_app_results(raw_results, app_results, settings.limit)
+    };
+
+    let mut rows = Vec::with_capacity(merged_results.len());
+    let mut paths = Vec::with_capacity(merged_results.len());
+    for item in merged_results {
         let name = std::path::Path::new(&item.path)
             .file_name()
             .and_then(|part| part.to_str())
             .map(|part| part.to_string())
             .unwrap_or_else(|| item.path.clone());
-        let kind = if item.line_number.is_some() {
+        let kind = if item.is_app {
+            "APP"
+        } else if item.line_number.is_some() {
             "LINE"
         } else if item.is_directory {
             "DIR"
@@ -912,14 +1274,21 @@ fn run_search(
                 .filter(|line| !line.is_empty())
                 .unwrap_or("<empty>");
             format!("{}:{}  {}", item.path, line_number, excerpt)
+        } else if item.is_app {
+            item.line_text
+                .clone()
+                .unwrap_or_else(|| format!("App • {}", item.path))
         } else {
             item.path.clone()
         };
-        rows.push(ResultRow {
-            kind: kind.into(),
-            name: name.into(),
-            path: item.path.clone().into(),
-            subtitle: subtitle.into(),
+        rows.push(UiRowData {
+            kind: kind.to_string(),
+            name,
+            path: item.path.clone(),
+            subtitle,
+            is_directory: item.is_directory,
+            is_app: item.is_app,
+            line_match: item.line_number.is_some(),
         });
         paths.push(item.path);
     }
@@ -950,6 +1319,7 @@ fn spawn_search_worker(
     config: Arc<GuiConfig>,
     settings_state: Arc<RwLock<GuiSettings>>,
     fallback_index: Arc<RwLock<Option<FileIndex>>>,
+    app_catalog: Arc<Mutex<AppCatalogCache>>,
     latest_request: Arc<AtomicU64>,
     paths: Arc<Mutex<Vec<String>>>,
 ) -> mpsc::Sender<SearchCommand> {
@@ -965,6 +1335,7 @@ fn spawn_search_worker(
                 &config,
                 &settings_state,
                 &fallback_index,
+                &app_catalog,
                 command.query,
                 &mut pipe_client,
             );
@@ -1018,6 +1389,9 @@ fn main() -> Result<()> {
         initial_settings.debounce_ms = debounce_ms;
     }
     sanitize_settings(&mut initial_settings);
+    if initial_settings.theme_auto {
+        initial_settings.light_theme = detect_system_light_theme();
+    }
 
     let config = Arc::new(GuiConfig {
         index_path: cli.index,
@@ -1025,6 +1399,7 @@ fn main() -> Result<()> {
     });
     let settings_state = Arc::new(RwLock::new(initial_settings.clone()));
     let fallback_index: Arc<RwLock<Option<FileIndex>>> = Arc::new(RwLock::new(None));
+    let app_catalog: Arc<Mutex<AppCatalogCache>> = Arc::new(Mutex::new(AppCatalogCache::default()));
     let latest_request = Arc::new(AtomicU64::new(0));
     let result_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -1056,6 +1431,10 @@ fn main() -> Result<()> {
     ui.set_settings_debounce_ms(initial_settings.debounce_ms as i32);
     ui.set_settings_content_mode(initial_settings.content_mode);
     ui.set_settings_fuzzy_mode(initial_settings.fuzzy_mode);
+    ui.set_settings_apps_mode(initial_settings.apps_mode);
+    ui.set_settings_theme_auto(initial_settings.theme_auto);
+    ui.set_settings_light_theme(initial_settings.light_theme);
+    ui.set_theme_light(initial_settings.light_theme);
     ui.set_settings_hint(settings_hint(&initial_settings).into());
     if let Some(notice) = startup_notice {
         ui.set_status_text(notice.into());
@@ -1124,6 +1503,7 @@ fn main() -> Result<()> {
         config.clone(),
         settings_state.clone(),
         fallback_index.clone(),
+        app_catalog.clone(),
         latest_request.clone(),
         result_paths.clone(),
     );
@@ -1215,6 +1595,9 @@ fn main() -> Result<()> {
                 ui.set_settings_debounce_ms(settings.debounce_ms as i32);
                 ui.set_settings_content_mode(settings.content_mode);
                 ui.set_settings_fuzzy_mode(settings.fuzzy_mode);
+                ui.set_settings_apps_mode(settings.apps_mode);
+                ui.set_settings_theme_auto(settings.theme_auto);
+                ui.set_settings_light_theme(settings.light_theme);
                 ui.set_settings_error_text("".into());
                 ui.set_show_settings(true);
             }
@@ -1244,6 +1627,9 @@ fn main() -> Result<()> {
                 ui.set_settings_debounce_ms(defaults.debounce_ms as i32);
                 ui.set_settings_content_mode(defaults.content_mode);
                 ui.set_settings_fuzzy_mode(defaults.fuzzy_mode);
+                ui.set_settings_apps_mode(defaults.apps_mode);
+                ui.set_settings_theme_auto(defaults.theme_auto);
+                ui.set_settings_light_theme(defaults.light_theme);
                 ui.set_settings_error_text("".into());
             }
         });
@@ -1275,7 +1661,10 @@ fn main() -> Result<()> {
                   limit,
                   debounce_ms,
                   content_mode,
-                  fuzzy_mode| {
+                  fuzzy_mode,
+                  apps_mode,
+                  theme_auto,
+                  light_theme| {
                 let mut next = GuiSettings {
                     under_dir: normalize_optional_text(under_dir.to_string()),
                     extension: normalize_optional_text(extension.to_string()),
@@ -1285,8 +1674,14 @@ fn main() -> Result<()> {
                     debounce_ms: debounce_ms.max(0) as u64,
                     content_mode,
                     fuzzy_mode,
+                    apps_mode,
+                    theme_auto,
+                    light_theme,
                 };
                 sanitize_settings(&mut next);
+                if next.theme_auto {
+                    next.light_theme = detect_system_light_theme();
+                }
                 if let Some(validation_error) = validate_settings(&next) {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_settings_error_text(validation_error.into());
@@ -1310,6 +1705,7 @@ fn main() -> Result<()> {
                             .unwrap_or_else(|| "<none>".to_string())
                             .into(),
                     );
+                    ui.set_theme_light(next.light_theme);
                     ui.set_settings_hint(settings_hint(&next).into());
                     ui.set_show_settings(false);
                     ui.set_settings_error_text("".into());

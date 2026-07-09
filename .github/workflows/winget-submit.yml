@@ -1,0 +1,23 @@
+name: Winget Submit
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to submit (example: 0.6.0)"
+        required: true
+        type: string
+
+jobs:
+  submit-winget:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Submit winget update PR
+        shell: pwsh
+        env:
+          WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
+        run: |
+          .\scripts\submit-winget.ps1 -Version "${{ inputs.version }}"

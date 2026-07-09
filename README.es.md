@@ -12,18 +12,21 @@ Motor de búsqueda de archivos ultrarrápido para Windows, escrito en Rust e ins
 - Busca por subcadena con filtros:
   - `--ext`
   - `--under`
+  - `--exclude`
   - `--glob`
   - `--dirs-only`
   - `--files-only`
   - `--limit`
 - Aplica cambios en vivo desde USN Journal (`FSCTL_READ_USN_JOURNAL`).
+- Usa persistencia comprimida con zstd (y mantiene compatibilidad con índices sin comprimir).
+- Incluye fallback de indexación con walker en unidades fijas no-NTFS.
 
 ## Estructura del proyecto
 
 - `crates/rayo-core`: indexado, búsqueda, integración NTFS/USN, persistencia.
 - `crates/rayo-cli`: interfaz CLI (`index`, `search`, `content`, `watch`).
 - `crates/rayo-service`: servicio de fondo elevado con índice en memoria, búsqueda por contenido y API por named pipe.
-- `crates/rayo-gui`: GUI nativa (`Slint`, estilo Fluent) con búsqueda por servicio/fallback, modo contenido, modo fuzzy, hotkey y panel de preview.
+- `crates/rayo-gui`: GUI nativa (`Slint`, estilo Fluent) con búsqueda por servicio/fallback, modo contenido, modo fuzzy, búsqueda de apps, tema auto, iconos por fila, hotkey y preview.
 
 ## Requisitos
 
@@ -51,11 +54,14 @@ cargo run -p rayo-cli -- search --index .\c.rayo --query rpt --fuzzy
 # Búsqueda de contenido (regex, estilo ripgrep)
 cargo run -p rayo-cli -- content --query "Rayo GUI search client" --under . --limit 20
 
+# Búsqueda sintáctica (tree-sitter)
+cargo run -p rayo-cli -- syntax --query "hello_world" --under .\crates --language rust --node-kind function_item
+
 # Mantener índice actualizado (terminal como Administrador)
-cargo run -p rayo-cli -- watch --drive C --index .\c.rayo
+cargo run -p rayo-cli -- watch --drive C --index .\c.rayo --exclude "C:\Windows,C:\Program Files"
 
 # Levantar servicio de fondo (terminal como Administrador)
-# Auto-detectar unidades NTFS fijas:
+# Auto-detectar unidades fijas:
 cargo run -p rayo-service -- --drives auto --index .\index.rayo
 # Multi-unidad con merge:
 cargo run -p rayo-service -- --drives C,D --index .\c.rayo
@@ -125,21 +131,18 @@ Validación de servicio + integración:
 
 ## Hoja de ruta
 
+### Completado
+
+- Paridad GUI: iconos por fila, búsqueda de apps instaladas y soporte claro/oscuro automático con toggle.
+- Eficiencia servicio/core: exclusiones configurables (`--exclude`), compresión zstd retrocompatible y fallback no-NTFS.
+- Settings del plugin PowerToys: límite, timeout de contenido, fuzzy, apps y score base.
+
 ### Siguiente
 
-- Consultas sintácticas con `tree-sitter`.
-- Llevar búsqueda de contenido al servicio y a la GUI.
-
-### Fase 3
-
-- Seguir puliendo la GUI Fluent nativa (menú contextual, atajos de teclado, acciones shell).
-- Arquitectura orientada a servicio:
-  - servicio de fondo para índice/watch,
-  - IPC para clientes de consulta (named pipes),
-  - GUI e integraciones Windows como clientes livianos.
-- Integraciones potenciales:
-  - plugin de PowerToys Run,
-  - acción de menú contextual en Explorer ("Search with Rayo here").
+- Distribución más sólida:
+  - publicar `RayoSetup.exe` desde release workflow (Inno Setup),
+  - automatizar PR a Winget con `wingetcreate`.
+- Consultas sintácticas con `tree-sitter` (CLI primero, GUI después).
 
 ## CI y empaquetado de release
 
@@ -184,7 +187,7 @@ Plugin también busca apps instaladas (Start Menu/WindowsApps) y muestra iconos 
 Usa el modo de tarea programada para que Rayo corra sin ventana de consola visible:
 
 ```powershell
-rayo-cli service install --service-exe "$env:LOCALAPPDATA\Rayo\rayo-service.exe" --drives C
+rayo-cli service install --service-exe "$env:LOCALAPPDATA\Rayo\rayo-service.exe" --drives C --exclude "C:\Windows,C:\Program Files"
 rayo-cli service status
 rayo-cli service uninstall
 ```
@@ -246,6 +249,7 @@ pwsh .\scripts\uninstall-powertoys-plugin.ps1 -RemoveData $true
 - Workflow por tag publica:
   - `rayo-windows.zip`
   - `RayoPlugin.zip`
+  - `RayoSetup.exe`
   - `rayo-winget-manifest-<versión>.zip`
 - Instalador descarga `RayoPlugin.zip` del último release automáticamente cuando no recibe `-PluginZipPath`.
 
@@ -259,7 +263,7 @@ pwsh .\scripts\generate-winget-manifest.ps1 -Version 0.3.0 -InstallerUrl "https:
 
 Si PowerToys muestra error al iniciar plugin Rayo:
 
-1. Verifica que usas último release (`v0.4.0` o superior).
+1. Verifica que usas último release (`v0.7.0` o superior).
 2. Reinstala plugin:
    ```powershell
    irm https://raw.githubusercontent.com/waar19/rayo/main/scripts/install-powertoys-plugin.ps1 | iex
