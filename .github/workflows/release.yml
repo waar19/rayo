@@ -113,11 +113,3 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
 
-      - name: Submit winget-pkgs PR
-        if: ${{ secrets.WINGET_GITHUB_TOKEN != '' }}
-        shell: pwsh
-        env:
-          WINGET_GITHUB_TOKEN: ${{ secrets.WINGET_GITHUB_TOKEN }}
-        run: |
-          $version = "${{ github.ref_name }}".TrimStart("v")
-          .\scripts\submit-winget.ps1 -Version $version -Token $env:WINGET_GITHUB_TOKEN
